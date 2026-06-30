@@ -10,7 +10,7 @@ class ExistingPolygonPickSheet {
     BuildContext context, {
     required List<WalkPolygon> polygons,
   }) {
-    final confirmed = polygons.where((p) => p.confirmed).toList()
+    final confirmed = polygons.where((p) => p.confirmed && p.isActive).toList()
       ..sort((a, b) => (b.createdAt ?? DateTime(0))
           .compareTo(a.createdAt ?? DateTime(0)));
 
@@ -82,7 +82,7 @@ class ExistingPolygonPickSheet {
                           title: Text('$name の多角形'),
                           subtitle: Text(
                             '作成: ${_formatTime(poly.createdAt)} ・ '
-                            '頂点 ${poly.vertices.length}',
+                            '頂点 ${poly.vertexCount}',
                           ),
                           trailing: const Icon(Icons.chevron_right),
                           onTap: () => Navigator.pop(ctx, poly),

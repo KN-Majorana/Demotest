@@ -10,14 +10,15 @@ import 'models/polygon.dart';
 
 /// 対戦モードの地図レイヤ。
 ///
-/// 自分＋フレンドの確定多角形を、それぞれのパレット色で塗って描画する。
-/// 機能2（時刻ベースの上書き）は「古い→新しい順に重ね描き」することで
-/// 視覚的に表現する（新しい多角形 A が古い多角形 B の上に乗る）。
+/// 自分＋フレンドの確定・active 多角形を、それぞれのパレット色で塗る。
+/// v3 以降、領域の上書きは [WalkPolygon] の幾何（rings/holes）そのものが
+/// 表しているため、ここでは「視覚的な重ね合わせ」を一切行わない。
+/// 各多角形の rings をそのまま塗り、holes は even-odd でくり抜く。
 class VersusModeOverlay extends StatelessWidget {
-  /// 描画対象（自分＋フレンドの確定多角形のみ）
+  /// 描画対象（自分＋フレンドの確定・active 多角形のみ）
   final List<WalkPolygon> polygons;
 
-  /// 自分の UID（自分の領域を強調表示するため）
+  /// 自分の UID（自分の領域を強調するため）
   final String? myUid;
 
   const VersusModeOverlay({
@@ -55,55 +56,58 @@ class _VersusPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    // 確定済みのみ。createdAt 昇順（古い→新しい）に並べ、新しい方を上に重ねる。
-    final drawList = polygons
-        .where((p) => p.confirmed && p.vertices.length >= 3)
-        .toList()
-      ..sort((a, b) {
-        final ta = a.createdAt?.millisecondsSinceEpoch ?? 0;
-        final tb = b.createdAt?.millisecondsSinceEpoch ?? 0;
-        return ta.compareTo(tb);
-      });
-
-    for (final poly in drawList) {
-      final path = _toPath(poly.vertices);
-      if (path == null) continue;
+    for (final poly in polygons) {
+      if (!poly.confirmed || !poly.isActive) continue;
+      if (poly.rings.isEmpty) continue;
 
       final pc = poly.colorId >= 0 && poly.colorId < colorPalette24.length
           ? colorPalette24[poly.colorId]
           : const ColorRGB(128, 128, 128);
       final isMine = myUid != null && poly.ownerUid == myUid;
 
-      // 塗り（新しい多角形が後に描かれるので自然に上書きされる）
-      canvas.drawPath(
-        path,
-        Paint()
-          ..color = Color.fromRGBO(pc.r, pc.g, pc.b, isMine ? 0.42 : 0.30)
-          ..style = PaintingStyle.fill,
-      );
+      for (int i = 0; i < poly.rings.length; i++) {
+        final ring = poly.rings[i];
+        if (ring.length < 3) continue;
 
-      // 枠線：自分は実線で濃く、フレンドはやや細く
-      canvas.drawPath(
-        path,
-        Paint()
-          ..color = Color.fromRGBO(pc.r, pc.g, pc.b, 1.0)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = isMine ? 3.0 : 1.5,
-      );
+        // 外周 ＋ 穴（even-odd でくり抜く）
+        final path = Path()..fillType = PathFillType.evenOdd;
+        _addRing(path, ring);
+        if (i < poly.holes.length) {
+          for (final hole in poly.holes[i]) {
+            if (hole.length >= 3) _addRing(path, hole);
+          }
+        }
+
+        // 塗り（幾何が示すままに塗る。重ね合成トリックは使わない）
+        canvas.drawPath(
+          path,
+          Paint()
+            ..color = Color.fromRGBO(pc.r, pc.g, pc.b, isMine ? 0.42 : 0.30)
+            ..style = PaintingStyle.fill,
+        );
+
+        // 外周の枠線
+        final outline = Path();
+        _addRing(outline, ring);
+        canvas.drawPath(
+          outline,
+          Paint()
+            ..color = Color.fromRGBO(pc.r, pc.g, pc.b, 1.0)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = isMine ? 3.0 : 1.5,
+        );
+      }
     }
   }
 
-  Path? _toPath(List<LatLng> verts) {
-    if (verts.length < 3) return null;
-    final pts = verts
-        .map((v) => _toOffset(camera.latLngToScreenPoint(v)))
-        .toList();
-    final path = Path()..moveTo(pts[0].dx, pts[0].dy);
+  void _addRing(Path path, List<LatLng> ring) {
+    final pts =
+        ring.map((v) => _toOffset(camera.latLngToScreenPoint(v))).toList();
+    path.moveTo(pts[0].dx, pts[0].dy);
     for (int i = 1; i < pts.length; i++) {
       path.lineTo(pts[i].dx, pts[i].dy);
     }
     path.close();
-    return path;
   }
 
   Offset _toOffset(Point<double> point) => Offset(point.x, point.y);

@@ -34,6 +34,7 @@ import 'services/export_service.dart';
 import 'services/firebase_auth_service.dart';
 import 'services/firestore_sync_service.dart';
 import 'services/photo_pin_storage_service.dart';
+import 'services/polygon_clip_service.dart';
 import 'services/polygon_overlap_service.dart';
 import 'services/polygon_storage_service.dart';
 import 'services/storage_upload_service.dart';
@@ -93,12 +94,24 @@ class _MapScreenState extends State<MapScreen> {
   /// 対戦モードで描画・集計する多角形（自分の確定分＋フレンドの確定分）。
   List<WalkPolygon> get _visiblePolygons {
     final friendUids = _friends.map((f) => f.uid).toSet();
-    final mine = _myPolygons.where((p) => p.confirmed).toList();
+    final mine =
+        _myPolygons.where((p) => p.confirmed && p.isActive).toList();
     final fromFriends = _remotePolygons.where((p) =>
         p.confirmed &&
+        p.isActive &&
         friendUids.contains(p.ownerUid) &&
         p.ownerUid != _myProfile?.uid);
     return [...mine, ...fromFriends];
+  }
+
+  /// 表示・集計用の実効ジオメトリ。各端末が共有された基本形（凸包）から、
+  /// 自分より新しく重なる多角形を引いてその場で計算する（書き戻しなし）。
+  List<WalkPolygon> get _effectivePolygons {
+    final base = _visiblePolygons;
+    return base
+        .map((p) => PolygonClipService.effectiveGeometry(p, base))
+        .where((p) => p.isActive && p.rings.isNotEmpty)
+        .toList();
   }
 
   @override
@@ -273,13 +286,24 @@ class _MapScreenState extends State<MapScreen> {
   void _deletePhotoPin(PhotoPin pin) {
     setState(() {
       _photoPins.removeWhere((p) => p.id == pin.id);
-      // 所属多角形の頂点を再計算（準備中に戻る場合もある）
+      // 所属多角形の頂点を再計算（3点未満なら共有から削除、以上なら作り直し）
       if (pin.polygonId != null) {
         _recomputeGroup(pin.polygonId!);
       }
     });
     _savePhotoPins();
     _saveMyPolygons();
+    _deleteRemotePhoto(pin.id);
+  }
+
+  /// 対戦参加中なら、削除した写真の Firestore メタと Storage 実体も削除する。
+  void _deleteRemotePhoto(String photoId) {
+    if (!_versusJoined) return;
+    FirestoreSyncService.deletePhoto(photoId);
+    final uid = _myProfile?.uid;
+    if (uid != null) {
+      StorageUploadService.deletePhoto(ownerUid: uid, photoId: photoId);
+    }
   }
 
   /// 指定 ID の多角形を、現在のメンバーピンから再計算する。
@@ -289,16 +313,27 @@ class _MapScreenState extends State<MapScreen> {
     final members =
         _photoPins.where((p) => p.polygonId == polygonId).toList();
     final positions = members.map((p) => p.position).toList();
+    final hull = PolygonOverlapService.convexHull(positions);
     var g = _myPolygons[idx].copyWith(
       photoIds: members.map((p) => p.id).toList(),
-      vertices: PolygonOverlapService.convexHull(positions),
+      rings: hull.isEmpty ? const <List<LatLng>>[] : [hull],
+      holes: hull.isEmpty
+          ? const <List<List<LatLng>>>[]
+          : <List<List<LatLng>>>[<List<LatLng>>[]],
     );
     if (members.length < 3) {
       g = g.copyWith(confirmed: false);
     }
     _myPolygons[idx] = g;
-    if (g.confirmed && _versusJoined) {
-      _syncPolygonUp(g);
+
+    if (_versusJoined) {
+      if (g.confirmed && g.isActive && g.rings.isNotEmpty) {
+        // 残りピンで作り直した基本形を共有に反映
+        _syncPolygonUp(g);
+      } else {
+        // 写真削除で3点未満になった → 共有から多角形を削除
+        FirestoreSyncService.deletePolygon(g.id);
+      }
     }
   }
 
@@ -503,22 +538,32 @@ class _MapScreenState extends State<MapScreen> {
   void _subscribeVersus() {
     _polygonSub?.cancel();
     _friendSub?.cancel();
-    _polygonSub = FirestoreSyncService.watchAllPolygons().listen((all) {
-      if (!mounted) return;
-      setState(() {
-        _remotePolygons
-          ..clear()
-          ..addAll(all);
-      });
-    });
-    _friendSub = FirestoreSyncService.watchFriends().listen((friends) {
-      if (!mounted) return;
-      setState(() {
-        _friends
-          ..clear()
-          ..addAll(friends);
-      });
-    });
+    _polygonSub = FirestoreSyncService.watchAllPolygons().listen(
+      (all) {
+        if (!mounted) return;
+        setState(() {
+          _remotePolygons
+            ..clear()
+            ..addAll(all);
+        });
+      },
+      onError: (Object e) {
+        debugPrint('polygons購読エラー: $e');
+      },
+    );
+    _friendSub = FirestoreSyncService.watchFriends().listen(
+      (friends) {
+        if (!mounted) return;
+        setState(() {
+          _friends
+            ..clear()
+            ..addAll(friends);
+        });
+      },
+      onError: (Object e) {
+        debugPrint('friends購読エラー: $e');
+      },
+    );
   }
 
   void _unsubscribeVersus() {
@@ -567,7 +612,7 @@ class _MapScreenState extends State<MapScreen> {
       MaterialPageRoute(
         fullscreenDialog: true,
         builder: (_) => AreaRankingScreen(
-          polygons: _visiblePolygons,
+          polygons: _effectivePolygons,
           myUid: _myProfile?.uid,
           friendCount: _friends.length,
         ),
@@ -605,7 +650,8 @@ class _MapScreenState extends State<MapScreen> {
     try {
       final result = await PolygonCreateFlow.run(
         context,
-        myConfirmedPolygons: _myPolygons.where((p) => p.confirmed).toList(),
+        myConfirmedPolygons:
+            _myPolygons.where((p) => p.confirmed && p.isActive).toList(),
         currentPosition: _currentPosition,
       );
       if (result == null) return; // キャンセル（写真はフロー内で破棄済み）
@@ -675,7 +721,8 @@ class _MapScreenState extends State<MapScreen> {
       ownerUid: _myProfile?.uid ?? 'local',
       ownerName: _myProfile?.displayName ?? '',
       colorId: colorId,
-      vertices: const [],
+      rings: const [],
+      holes: const [],
       createdAt: null,
       photoIds: const [],
       confirmed: false,
@@ -708,9 +755,13 @@ class _MapScreenState extends State<MapScreen> {
       pos,
     ];
 
+    final hull = PolygonOverlapService.convexHull(positions);
     var g = group.copyWith(
       photoIds: [...group.photoIds, pin.id],
-      vertices: PolygonOverlapService.convexHull(positions),
+      rings: hull.isEmpty ? const <List<LatLng>>[] : [hull],
+      holes: hull.isEmpty
+          ? const <List<List<LatLng>>>[]
+          : <List<List<LatLng>>>[<List<LatLng>>[]],
     );
 
     // 3 枚目で確定
@@ -731,6 +782,8 @@ class _MapScreenState extends State<MapScreen> {
     _savePhotoPins();
     _saveMyPolygons();
 
+    // v3.1: 減算は各端末が表示時に計算する（書き戻しなし）。
+    // ここでは確定した「素の凸包（基本形）」だけを共有する。
     if (g.confirmed && _versusJoined) {
       _syncPolygonUp(g);
     }
@@ -765,6 +818,9 @@ class _MapScreenState extends State<MapScreen> {
             });
             _savePhotoPins();
             _saveMyPolygons();
+            for (final id in ids) {
+              _deleteRemotePhoto(id);
+            }
           },
         ),
       ),
@@ -960,7 +1016,7 @@ class _MapScreenState extends State<MapScreen> {
               // 対戦オーバーレイ（自分＋フレンドの多角形）
               if (_mode == MapMode.versus)
                 VersusModeOverlay(
-                  polygons: _visiblePolygons,
+                  polygons: _effectivePolygons,
                   myUid: _myProfile?.uid,
                 ),
               // 写真ピン(全モードで表示)
