@@ -65,12 +65,18 @@ service cloud.firestore {
       }
     }
 
-    // 多角形: 書き込みは ownerUid == 自分のときのみ。読み取りは認証済みなら可
-    // （フレンド限定の描画はクライアント側でフィルタ）。
+    // 多角形:
+    //   - create / delete は所有者のみ。
+    //   - update は「認証済みなら誰でも可」とする。これは機能2(v3)で
+    //     A の所有者がフレンド B の領域を幾何学的に減算し、B のドキュメントへ
+    //     書き戻す（領域を奪う）ために必要。ownerUid 自体の改変は禁止する。
+    //   - 読み取りは認証済みなら可（フレンド限定描画はクライアント側フィルタ）。
     match /polygons/{polygonId} {
       allow read: if request.auth != null;
-      allow create, update: if request.auth != null
+      allow create: if request.auth != null
         && request.resource.data.ownerUid == request.auth.uid;
+      allow update: if request.auth != null
+        && request.resource.data.ownerUid == resource.data.ownerUid;
       allow delete: if request.auth != null
         && resource.data.ownerUid == request.auth.uid;
     }

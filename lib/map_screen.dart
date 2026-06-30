@@ -34,6 +34,7 @@ import 'services/export_service.dart';
 import 'services/firebase_auth_service.dart';
 import 'services/firestore_sync_service.dart';
 import 'services/photo_pin_storage_service.dart';
+import 'services/polygon_clip_service.dart';
 import 'services/polygon_overlap_service.dart';
 import 'services/polygon_storage_service.dart';
 import 'services/storage_upload_service.dart';
@@ -93,9 +94,11 @@ class _MapScreenState extends State<MapScreen> {
   /// 対戦モードで描画・集計する多角形（自分の確定分＋フレンドの確定分）。
   List<WalkPolygon> get _visiblePolygons {
     final friendUids = _friends.map((f) => f.uid).toSet();
-    final mine = _myPolygons.where((p) => p.confirmed).toList();
+    final mine =
+        _myPolygons.where((p) => p.confirmed && p.isActive).toList();
     final fromFriends = _remotePolygons.where((p) =>
         p.confirmed &&
+        p.isActive &&
         friendUids.contains(p.ownerUid) &&
         p.ownerUid != _myProfile?.uid);
     return [...mine, ...fromFriends];
@@ -289,9 +292,13 @@ class _MapScreenState extends State<MapScreen> {
     final members =
         _photoPins.where((p) => p.polygonId == polygonId).toList();
     final positions = members.map((p) => p.position).toList();
+    final hull = PolygonOverlapService.convexHull(positions);
     var g = _myPolygons[idx].copyWith(
       photoIds: members.map((p) => p.id).toList(),
-      vertices: PolygonOverlapService.convexHull(positions),
+      rings: hull.isEmpty ? const <List<LatLng>>[] : [hull],
+      holes: hull.isEmpty
+          ? const <List<List<LatLng>>>[]
+          : <List<List<LatLng>>>[<List<LatLng>>[]],
     );
     if (members.length < 3) {
       g = g.copyWith(confirmed: false);
@@ -605,7 +612,8 @@ class _MapScreenState extends State<MapScreen> {
     try {
       final result = await PolygonCreateFlow.run(
         context,
-        myConfirmedPolygons: _myPolygons.where((p) => p.confirmed).toList(),
+        myConfirmedPolygons:
+            _myPolygons.where((p) => p.confirmed && p.isActive).toList(),
         currentPosition: _currentPosition,
       );
       if (result == null) return; // キャンセル（写真はフロー内で破棄済み）
@@ -675,7 +683,8 @@ class _MapScreenState extends State<MapScreen> {
       ownerUid: _myProfile?.uid ?? 'local',
       ownerName: _myProfile?.displayName ?? '',
       colorId: colorId,
-      vertices: const [],
+      rings: const [],
+      holes: const [],
       createdAt: null,
       photoIds: const [],
       confirmed: false,
@@ -708,9 +717,13 @@ class _MapScreenState extends State<MapScreen> {
       pos,
     ];
 
+    final hull = PolygonOverlapService.convexHull(positions);
     var g = group.copyWith(
       photoIds: [...group.photoIds, pin.id],
-      vertices: PolygonOverlapService.convexHull(positions),
+      rings: hull.isEmpty ? const <List<LatLng>>[] : [hull],
+      holes: hull.isEmpty
+          ? const <List<List<LatLng>>>[]
+          : <List<List<LatLng>>>[<List<LatLng>>[]],
     );
 
     // 3 枚目で確定
@@ -723,6 +736,8 @@ class _MapScreenState extends State<MapScreen> {
       );
     }
 
+    final justConfirmed = !group.confirmed && g.confirmed;
+
     setState(() {
       _photoPins.add(pin);
       _upsertGroup(g);
@@ -733,7 +748,50 @@ class _MapScreenState extends State<MapScreen> {
 
     if (g.confirmed && _versusJoined) {
       _syncPolygonUp(g);
+      // 機能2(v3): 新規に確定した A で、より古い B を幾何学的に減算する
+      if (justConfirmed && _mode == MapMode.versus) {
+        _applyTerritoryOverride(g);
+      }
     }
+  }
+
+  /// 機能2(v3)：新規確定した [a] で、より古く重なる B を幾何学的に減算し、
+  /// 更新後の B を Firestore に書き戻す。対戦モードのみで実行する。
+  Future<void> _applyTerritoryOverride(WalkPolygon a) async {
+    if (!_versusJoined || _mode != MapMode.versus) return;
+    if (a.rings.isEmpty || a.createdAt == null) return;
+    final aRing = a.rings.first;
+
+    // 候補B：自分＋フレンドの確定・active・A より古い多角形
+    final all = <WalkPolygon>[..._myPolygons, ..._remotePolygons];
+    final seen = <String>{};
+    for (final b in all) {
+      if (b.id == a.id || seen.contains(b.id)) continue;
+      seen.add(b.id);
+      if (!b.confirmed || !b.isActive || b.createdAt == null) continue;
+      if (!a.createdAt!.isAfter(b.createdAt!)) continue; // 等時刻含め古い時のみ
+      if (!PolygonClipService.regionsOverlap(b, aRing)) continue;
+
+      WalkPolygon updated;
+      try {
+        updated = PolygonClipService.subtract(b, aRing, a.id);
+      } catch (_) {
+        continue; // 異常時は B を変更しない
+      }
+      if (identical(updated, b)) continue;
+
+      // 自分の多角形ならローカルも更新
+      final li = _myPolygons.indexWhere((p) => p.id == b.id);
+      if (li >= 0) {
+        setState(() => _myPolygons[li] = updated);
+      }
+
+      // Firestore へ書き戻し（フレンドの B でも更新できるようルール緩和済み）
+      try {
+        await FirestoreSyncService.updatePolygonGeometry(updated);
+      } catch (_) {}
+    }
+    _saveMyPolygons();
   }
 
   void _upsertGroup(WalkPolygon g) {
