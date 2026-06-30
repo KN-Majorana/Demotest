@@ -510,22 +510,32 @@ class _MapScreenState extends State<MapScreen> {
   void _subscribeVersus() {
     _polygonSub?.cancel();
     _friendSub?.cancel();
-    _polygonSub = FirestoreSyncService.watchAllPolygons().listen((all) {
-      if (!mounted) return;
-      setState(() {
-        _remotePolygons
-          ..clear()
-          ..addAll(all);
-      });
-    });
-    _friendSub = FirestoreSyncService.watchFriends().listen((friends) {
-      if (!mounted) return;
-      setState(() {
-        _friends
-          ..clear()
-          ..addAll(friends);
-      });
-    });
+    _polygonSub = FirestoreSyncService.watchAllPolygons().listen(
+      (all) {
+        if (!mounted) return;
+        setState(() {
+          _remotePolygons
+            ..clear()
+            ..addAll(all);
+        });
+      },
+      onError: (Object e) {
+        debugPrint('polygons購読エラー: $e');
+      },
+    );
+    _friendSub = FirestoreSyncService.watchFriends().listen(
+      (friends) {
+        if (!mounted) return;
+        setState(() {
+          _friends
+            ..clear()
+            ..addAll(friends);
+        });
+      },
+      onError: (Object e) {
+        debugPrint('friends購読エラー: $e');
+      },
+    );
   }
 
   void _unsubscribeVersus() {

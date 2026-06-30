@@ -90,11 +90,17 @@ class FirestoreSyncService {
   static Stream<List<FriendProfile>> watchFriends() {
     final uid = FirebaseAuthService.uid;
     if (uid == null) return Stream.value(const []);
-    return _users.doc(uid).collection('friends').snapshots().map(
-          (snap) => snap.docs
-              .map((d) => FriendProfile.fromMap(d.id, d.data()))
-              .toList(),
-        );
+    return _users.doc(uid).collection('friends').snapshots().map((snap) {
+      final out = <FriendProfile>[];
+      for (final d in snap.docs) {
+        try {
+          out.add(FriendProfile.fromMap(d.id, d.data()));
+        } catch (_) {
+          // 壊れた1件で全体を落とさない
+        }
+      }
+      return out;
+    });
   }
 
   /// フレンドコードからフレンドを追加する。追加した相手の FriendProfile を返す。
@@ -140,10 +146,17 @@ class FirestoreSyncService {
   /// 全多角形を createdAt 昇順で購読する。
   /// フレンド限定の絞り込みはクライアント側で行う（セキュリティルール参照）。
   static Stream<List<WalkPolygon>> watchAllPolygons() {
-    return _polygons.orderBy('createdAt').snapshots().map(
-          (snap) =>
-              snap.docs.map((d) => WalkPolygon.fromMap(d.data())).toList(),
-        );
+    return _polygons.orderBy('createdAt').snapshots().map((snap) {
+      final out = <WalkPolygon>[];
+      for (final d in snap.docs) {
+        try {
+          out.add(WalkPolygon.fromMap(d.data()));
+        } catch (_) {
+          // 壊れた/旧形式で読めない1件はスキップ（全体は落とさない）
+        }
+      }
+      return out;
+    });
   }
 
   /// 多角形を作成 / 更新する（確定済みのみ呼ぶ想定）。

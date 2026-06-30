@@ -130,14 +130,27 @@ class WalkPolygon {
     return LatLng((m['lat'] as num).toDouble(), (m['lng'] as num).toDouble());
   }
 
+  /// 1 リングをパース。新形式 {'points':[...]} と旧形式 [...] の両対応。
+  static List<LatLng> _parseRing(dynamic r) {
+    if (r is Map) {
+      return (r['points'] as List<dynamic>? ?? []).map(_toLL).toList();
+    }
+    return (r as List<dynamic>).map(_toLL).toList();
+  }
+
+  // Firestore は「配列の直下に配列」を許可しないため、各リングを
+  // map（{'points': [...]}）で包む。holes も同様に map で包む。
+  static Map<String, dynamic> _ringMap(List<LatLng> ring) =>
+      {'points': ring.map(_ll).toList()};
+
   Map<String, dynamic> toMap() => {
         'id': id,
         'ownerUid': ownerUid,
         'ownerName': ownerName,
         'colorId': colorId,
-        'rings': rings.map((r) => r.map(_ll).toList()).toList(),
+        'rings': rings.map(_ringMap).toList(),
         'holes': holes
-            .map((hl) => hl.map((h) => h.map(_ll).toList()).toList())
+            .map((hl) => {'rings': hl.map(_ringMap).toList()})
             .toList(),
         'createdAt': createdAt?.millisecondsSinceEpoch,
         'lastModifiedAt': lastModifiedAt?.millisecondsSinceEpoch,
@@ -153,9 +166,7 @@ class WalkPolygon {
     List<List<List<LatLng>>> holes;
 
     if (map['rings'] != null) {
-      rings = (map['rings'] as List<dynamic>)
-          .map((r) => (r as List<dynamic>).map(_toLL).toList())
-          .toList();
+      rings = (map['rings'] as List<dynamic>).map(_parseRing).toList();
     } else if (map['vertices'] != null) {
       // 旧形式: 単一リング
       final verts = (map['vertices'] as List<dynamic>).map(_toLL).toList();
@@ -165,11 +176,15 @@ class WalkPolygon {
     }
 
     if (map['holes'] != null) {
-      holes = (map['holes'] as List<dynamic>)
-          .map((hl) => (hl as List<dynamic>)
-              .map((h) => (h as List<dynamic>).map(_toLL).toList())
-              .toList())
-          .toList();
+      holes = (map['holes'] as List<dynamic>).map((hl) {
+        // 新形式: {'rings': [ {'points':[...]}, ... ]}
+        if (hl is Map) {
+          final inner = (hl['rings'] as List<dynamic>? ?? []);
+          return inner.map(_parseRing).toList();
+        }
+        // 旧形式（入れ子リスト）
+        return (hl as List<dynamic>).map(_parseRing).toList();
+      }).toList();
     } else {
       // rings と同じ長さの空穴リストで初期化
       holes = List.generate(rings.length, (_) => <List<LatLng>>[]);
