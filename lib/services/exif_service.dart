@@ -52,6 +52,29 @@ class ExifService {
     return points;
   }
 
+  /// 単一の画像ファイルから EXIF の GPS と撮影日時を読み取る。
+  /// 取得できない項目は null を返す（呼び出し側でフォールバックする）。
+  static Future<({double? lat, double? lng, DateTime? timestamp})>
+      readExifForFile(String path) async {
+    try {
+      final file = File(path);
+      if (!file.existsSync()) {
+        return (lat: null, lng: null, timestamp: null);
+      }
+      final bytes = await file.readAsBytes();
+      final tags = await readExifFromBytes(bytes);
+      final loc = _extractLocation(tags);
+
+      DateTime? ts;
+      final dtTag = tags['EXIF DateTimeOriginal'] ?? tags['Image DateTime'];
+      if (dtTag != null) ts = _parseExifDate(dtTag.printable);
+
+      return (lat: loc?.$1, lng: loc?.$2, timestamp: ts);
+    } catch (_) {
+      return (lat: null, lng: null, timestamp: null);
+    }
+  }
+
   // ── 内部ヘルパー ──────────────────────────
 
   static (double, double)? _extractLocation(Map<String, IfdTag> tags) {
