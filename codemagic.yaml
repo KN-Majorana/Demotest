@@ -1,26 +1,40 @@
-workflows:
-  ios-unsigned:
+ios-unsigned:
     name: iOS Unsigned IPA
     instance_type: mac_mini_m2
-    max_build_duration: 60
+    max_build_duration: 90
     environment:
       flutter: stable
       xcode: latest
       cocoapods: default
     scripts:
-      - name: Set up iOS project
+      - name: Flutter pub get
         script: |
           flutter pub get
-          flutter create . --platforms=ios
+      - name: Generate iOS Podfile / config (Info.plist は上書きしない)
+        script: |
+          # 既存 ios プロジェクトをそのまま使う。Podfile 等が無ければ生成のみ行う。
+          flutter build ios --release --no-codesign --config-only
+      - name: Force iOS 13 platform (Firebase は iOS 13+ が必須)
+        script: |
+          cd ios
+          if grep -q "platform :ios" Podfile; then
+            sed -i.bak "s/^# *platform :ios.*/platform :ios, '13.0'/" Podfile
+            sed -i.bak "s/^platform :ios.*/platform :ios, '13.0'/" Podfile
+          else
+            printf "platform :ios, '13.0'\n%s" "$(cat Podfile)" > Podfile
+          fi
+          grep "platform :ios" Podfile || true
+      - name: Pod install
+        script: |
           cd ios
           pod install --repo-update
-      - name: Build unsigned ipa
+      - name: Build unsigned .app and package as .ipa
         script: |
           flutter build ios --release --no-codesign
           cd build/ios/iphoneos
-          mkdir Payload
+          mkdir -p Payload
           mv Runner.app Payload/
-          zip -r Runner.ipa Payload
+          zip -r Runner.ipa Payload >/dev/null
     artifacts:
       - build/ios/iphoneos/Runner.ipa
       - /tmp/xcodebuild_logs/*.log
