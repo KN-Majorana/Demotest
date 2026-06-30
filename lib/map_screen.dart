@@ -104,6 +104,16 @@ class _MapScreenState extends State<MapScreen> {
     return [...mine, ...fromFriends];
   }
 
+  /// 表示・集計用の実効ジオメトリ。各端末が共有された基本形（凸包）から、
+  /// 自分より新しく重なる多角形を引いてその場で計算する（書き戻しなし）。
+  List<WalkPolygon> get _effectivePolygons {
+    final base = _visiblePolygons;
+    return base
+        .map((p) => PolygonClipService.effectiveGeometry(p, base))
+        .where((p) => p.isActive && p.rings.isNotEmpty)
+        .toList();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -276,13 +286,24 @@ class _MapScreenState extends State<MapScreen> {
   void _deletePhotoPin(PhotoPin pin) {
     setState(() {
       _photoPins.removeWhere((p) => p.id == pin.id);
-      // 所属多角形の頂点を再計算（準備中に戻る場合もある）
+      // 所属多角形の頂点を再計算（3点未満なら共有から削除、以上なら作り直し）
       if (pin.polygonId != null) {
         _recomputeGroup(pin.polygonId!);
       }
     });
     _savePhotoPins();
     _saveMyPolygons();
+    _deleteRemotePhoto(pin.id);
+  }
+
+  /// 対戦参加中なら、削除した写真の Firestore メタと Storage 実体も削除する。
+  void _deleteRemotePhoto(String photoId) {
+    if (!_versusJoined) return;
+    FirestoreSyncService.deletePhoto(photoId);
+    final uid = _myProfile?.uid;
+    if (uid != null) {
+      StorageUploadService.deletePhoto(ownerUid: uid, photoId: photoId);
+    }
   }
 
   /// 指定 ID の多角形を、現在のメンバーピンから再計算する。
@@ -304,8 +325,15 @@ class _MapScreenState extends State<MapScreen> {
       g = g.copyWith(confirmed: false);
     }
     _myPolygons[idx] = g;
-    if (g.confirmed && _versusJoined) {
-      _syncPolygonUp(g);
+
+    if (_versusJoined) {
+      if (g.confirmed && g.isActive && g.rings.isNotEmpty) {
+        // 残りピンで作り直した基本形を共有に反映
+        _syncPolygonUp(g);
+      } else {
+        // 写真削除で3点未満になった → 共有から多角形を削除
+        FirestoreSyncService.deletePolygon(g.id);
+      }
     }
   }
 
@@ -584,7 +612,7 @@ class _MapScreenState extends State<MapScreen> {
       MaterialPageRoute(
         fullscreenDialog: true,
         builder: (_) => AreaRankingScreen(
-          polygons: _visiblePolygons,
+          polygons: _effectivePolygons,
           myUid: _myProfile?.uid,
           friendCount: _friends.length,
         ),
@@ -746,8 +774,6 @@ class _MapScreenState extends State<MapScreen> {
       );
     }
 
-    final justConfirmed = !group.confirmed && g.confirmed;
-
     setState(() {
       _photoPins.add(pin);
       _upsertGroup(g);
@@ -756,52 +782,11 @@ class _MapScreenState extends State<MapScreen> {
     _savePhotoPins();
     _saveMyPolygons();
 
+    // v3.1: 減算は各端末が表示時に計算する（書き戻しなし）。
+    // ここでは確定した「素の凸包（基本形）」だけを共有する。
     if (g.confirmed && _versusJoined) {
       _syncPolygonUp(g);
-      // 機能2(v3): 新規に確定した A で、より古い B を幾何学的に減算する
-      if (justConfirmed && _mode == MapMode.versus) {
-        _applyTerritoryOverride(g);
-      }
     }
-  }
-
-  /// 機能2(v3)：新規確定した [a] で、より古く重なる B を幾何学的に減算し、
-  /// 更新後の B を Firestore に書き戻す。対戦モードのみで実行する。
-  Future<void> _applyTerritoryOverride(WalkPolygon a) async {
-    if (!_versusJoined || _mode != MapMode.versus) return;
-    if (a.rings.isEmpty || a.createdAt == null) return;
-    final aRing = a.rings.first;
-
-    // 候補B：自分＋フレンドの確定・active・A より古い多角形
-    final all = <WalkPolygon>[..._myPolygons, ..._remotePolygons];
-    final seen = <String>{};
-    for (final b in all) {
-      if (b.id == a.id || seen.contains(b.id)) continue;
-      seen.add(b.id);
-      if (!b.confirmed || !b.isActive || b.createdAt == null) continue;
-      if (!a.createdAt!.isAfter(b.createdAt!)) continue; // 等時刻含め古い時のみ
-      if (!PolygonClipService.regionsOverlap(b, aRing)) continue;
-
-      WalkPolygon updated;
-      try {
-        updated = PolygonClipService.subtract(b, aRing, a.id);
-      } catch (_) {
-        continue; // 異常時は B を変更しない
-      }
-      if (identical(updated, b)) continue;
-
-      // 自分の多角形ならローカルも更新
-      final li = _myPolygons.indexWhere((p) => p.id == b.id);
-      if (li >= 0) {
-        setState(() => _myPolygons[li] = updated);
-      }
-
-      // Firestore へ書き戻し（フレンドの B でも更新できるようルール緩和済み）
-      try {
-        await FirestoreSyncService.updatePolygonGeometry(updated);
-      } catch (_) {}
-    }
-    _saveMyPolygons();
   }
 
   void _upsertGroup(WalkPolygon g) {
@@ -833,6 +818,9 @@ class _MapScreenState extends State<MapScreen> {
             });
             _savePhotoPins();
             _saveMyPolygons();
+            for (final id in ids) {
+              _deleteRemotePhoto(id);
+            }
           },
         ),
       ),
@@ -1028,7 +1016,7 @@ class _MapScreenState extends State<MapScreen> {
               // 対戦オーバーレイ（自分＋フレンドの多角形）
               if (_mode == MapMode.versus)
                 VersusModeOverlay(
-                  polygons: _visiblePolygons,
+                  polygons: _effectivePolygons,
                   myUid: _myProfile?.uid,
                 ),
               // 写真ピン(全モードで表示)

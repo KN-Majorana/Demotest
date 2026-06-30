@@ -25,4 +25,16 @@ class StorageUploadService {
     );
     return task.ref.getDownloadURL();
   }
+
+  /// アップロード済みの写真を Storage から削除する（存在しなくても無視）。
+  static Future<void> deletePhoto({
+    required String ownerUid,
+    required String photoId,
+  }) async {
+    try {
+      await _storage.ref('photos/$ownerUid/$photoId.jpg').delete();
+    } catch (_) {
+      // 未アップロード / 既に削除済みなどは無視
+    }
+  }
 }

@@ -87,6 +87,35 @@ class PolygonClipService {
     );
   }
 
+  /// 表示・集計用：多角形 [p] から、自分より新しく重なる [all] 内の多角形の
+  /// 「素の凸包（基本形 = rings.first）」を順に引いた実効ジオメトリを返す。
+  ///
+  /// データを Firestore に書き戻さず、各端末がこの同じ計算を行うため、
+  /// どの端末でも同一の結果（分裂・くり抜き）になる。
+  static WalkPolygon effectiveGeometry(WalkPolygon p, List<WalkPolygon> all) {
+    if (p.rings.isEmpty || p.createdAt == null) return p;
+
+    final newer = all
+        .where((q) =>
+            q.id != p.id &&
+            q.confirmed &&
+            q.isActive &&
+            q.createdAt != null &&
+            q.createdAt!.isAfter(p.createdAt!))
+        .toList()
+      ..sort((a, b) => a.createdAt!.compareTo(b.createdAt!));
+
+    var region = p;
+    for (final q in newer) {
+      if (q.rings.isEmpty) continue;
+      final aRing = q.rings.first;
+      if (!regionsOverlap(region, aRing)) continue;
+      region = subtract(region, aRing, q.id);
+      if (!region.isActive || region.rings.isEmpty) break;
+    }
+    return region;
+  }
+
   /// B の領域（外周リング群）と凸リング A が面積的に重なるかの簡易判定。
   static bool regionsOverlap(WalkPolygon b, List<LatLng> aRing) {
     for (final outer in b.rings) {

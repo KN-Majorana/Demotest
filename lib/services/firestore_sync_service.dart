@@ -193,6 +193,13 @@ class FirestoreSyncService {
   // 写真メタ（photos）
   // ─────────────────────────────────────────
 
+  /// 写真メタ（photos/{photoId}）を削除する。
+  static Future<void> deletePhoto(String photoId) async {
+    try {
+      await _photos.doc(photoId).delete();
+    } catch (_) {}
+  }
+
   static Future<void> upsertPhoto({
     required String photoId,
     required String ownerUid,
