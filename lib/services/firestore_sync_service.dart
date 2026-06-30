@@ -90,11 +90,17 @@ class FirestoreSyncService {
   static Stream<List<FriendProfile>> watchFriends() {
     final uid = FirebaseAuthService.uid;
     if (uid == null) return Stream.value(const []);
-    return _users.doc(uid).collection('friends').snapshots().map(
-          (snap) => snap.docs
-              .map((d) => FriendProfile.fromMap(d.id, d.data()))
-              .toList(),
-        );
+    return _users.doc(uid).collection('friends').snapshots().map((snap) {
+      final out = <FriendProfile>[];
+      for (final d in snap.docs) {
+        try {
+          out.add(FriendProfile.fromMap(d.id, d.data()));
+        } catch (_) {
+          // 壊れた1件で全体を落とさない
+        }
+      }
+      return out;
+    });
   }
 
   /// フレンドコードからフレンドを追加する。追加した相手の FriendProfile を返す。
@@ -140,10 +146,17 @@ class FirestoreSyncService {
   /// 全多角形を createdAt 昇順で購読する。
   /// フレンド限定の絞り込みはクライアント側で行う（セキュリティルール参照）。
   static Stream<List<WalkPolygon>> watchAllPolygons() {
-    return _polygons.orderBy('createdAt').snapshots().map(
-          (snap) =>
-              snap.docs.map((d) => WalkPolygon.fromMap(d.data())).toList(),
-        );
+    return _polygons.orderBy('createdAt').snapshots().map((snap) {
+      final out = <WalkPolygon>[];
+      for (final d in snap.docs) {
+        try {
+          out.add(WalkPolygon.fromMap(d.data()));
+        } catch (_) {
+          // 壊れた/旧形式で読めない1件はスキップ（全体は落とさない）
+        }
+      }
+      return out;
+    });
   }
 
   /// 多角形を作成 / 更新する（確定済みのみ呼ぶ想定）。
@@ -153,6 +166,27 @@ class FirestoreSyncService {
 
   static Future<void> deletePolygon(String polygonId) async {
     await _polygons.doc(polygonId).delete();
+  }
+
+  /// 機能2(v3)：減算後の多角形ジオメトリを書き戻す。
+  /// フレンドの B でも更新できるよう、セキュリティルールで polygons の
+  /// update は認証済みなら許可している（README 参照）。
+  /// 競合に備えてトランザクションで上書きする。
+  static Future<void> updatePolygonGeometry(WalkPolygon polygon) async {
+    final ref = _polygons.doc(polygon.id);
+    await _db.runTransaction((tx) async {
+      tx.set(
+        ref,
+        {
+          'rings': polygon.toMap()['rings'],
+          'holes': polygon.toMap()['holes'],
+          'status': polygon.status,
+          'lastModifiedAt': polygon.lastModifiedAt?.millisecondsSinceEpoch,
+          'subtractedBy': polygon.subtractedBy,
+        },
+        SetOptions(merge: true),
+      );
+    });
   }
 
   // ─────────────────────────────────────────
