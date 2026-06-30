@@ -7,7 +7,6 @@ import 'package:latlong2/latlong.dart';
 import 'area_ranking_screen.dart';
 import 'color_collage_screen.dart';
 import 'color_extraction.dart';
-import 'color_picker_sheet.dart';
 import 'fog_settings_service.dart';
 import 'current_location_marker.dart';
 import 'fog_overlay.dart';
@@ -21,7 +20,7 @@ import 'photo_list_screen.dart';
 import 'photo_pin.dart';
 import 'photo_pin_marker.dart';
 import 'photo_service.dart';
-import 'polygon_choice_sheet.dart';
+import 'polygon_create_flow.dart';
 import 'recording_controls.dart';
 import 'track_picker_sheet.dart';
 import 'track_storage_service.dart';
@@ -31,7 +30,6 @@ import 'ghost_marker.dart';
 import 'models/friend_profile.dart';
 import 'models/location_point.dart';
 import 'models/polygon.dart';
-import 'services/exif_service.dart';
 import 'services/export_service.dart';
 import 'services/firebase_auth_service.dart';
 import 'services/firestore_sync_service.dart';
@@ -602,68 +600,62 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  // ─── 写真撮影（機能3：新規作成 / 既存追加 を選択） ───
-  Future<void> _takePhoto() async {
+  // ─── 「多角形を作る」フロー（ステップ A→B→C→D） ───
+  Future<void> _openCreatePolygonFlow() async {
     try {
-      // 撮影直前に最新の現在地を取りに行く
-      LatLng photoPosition = _currentPosition;
-      try {
-        photoPosition = await LocationService.getCurrentPosition();
-      } catch (_) {}
-
-      final path = await PhotoService.takeAndSavePhoto();
-      if (path == null) return; // キャンセル
-      if (!mounted) return;
-
-      // 写真の主要色を抽出（24色パレットのインデックス）
-      final colorIds = await extractColorIdsFromPath(path);
-      if (!mounted) return;
-
-      // [A] 新規作成 / [B] 既存に追加 を選択
-      final choice = await PolygonChoiceSheet.show(
+      final result = await PolygonCreateFlow.run(
         context,
-        existingPolygons: _myPolygons.where((p) => p.confirmed).toList(),
+        myConfirmedPolygons: _myPolygons.where((p) => p.confirmed).toList(),
+        currentPosition: _currentPosition,
       );
-      if (choice == null) {
-        await PhotoService.deletePhotoFile(path); // 破棄
-        return;
-      }
+      if (result == null) return; // キャンセル（写真はフロー内で破棄済み）
       if (!mounted) return;
 
-      if (choice.kind == PolygonChoiceKind.createNew) {
-        // [A] 色を選ばせる
-        final colorId = await ColorPickerSheet.show(context);
-        if (colorId == null) {
-          await PhotoService.deletePhotoFile(path);
+      if (result.usedLocationFallback) {
+        _toast('位置情報が取得できなかったため、現在地・現在時刻で登録します');
+      }
+
+      // ── ステップ D（後半）：色一致チェックとピン確定 ──
+      if (result.kind == PolygonCreateKind.createNew) {
+        final colorId = result.colorId!;
+        if (!result.colorIds.contains(colorId)) {
+          await PhotoService.deletePhotoFile(result.photoPath); // 破棄
+          _toast('指定した色と一致しないため追加できません');
           return;
         }
-        // 指定色と判定色が一致しない → ピンを立てない・写真破棄
-        if (!colorIds.contains(colorId)) {
-          await PhotoService.deletePhotoFile(path);
-          _toast('指定した色と一致しません');
-          return;
-        }
-        final group = _pendingGroupForColor(colorId) ?? _createNewGroup(colorId);
-        _addPinAndAttach(path, photoPosition, colorIds, group);
+        final group =
+            _pendingGroupForColor(colorId) ?? _createNewGroup(colorId);
+        _addPinAndAttach(
+          result.photoPath,
+          result.position,
+          result.takenAt,
+          result.colorIds,
+          group,
+        );
         final name =
             colorId < colorNames24.length ? colorNames24[colorId] : '';
         _toast('「$name」の多角形にピンを追加しました');
       } else {
-        // [B] 既存多角形に追加。色が一致する場合のみ。
-        final target = choice.target!;
-        if (!colorIds.contains(target.colorId)) {
-          await PhotoService.deletePhotoFile(path);
-          _toast('色が一致しません');
+        final target = result.target!;
+        if (!result.colorIds.contains(target.colorId)) {
+          await PhotoService.deletePhotoFile(result.photoPath); // 破棄
+          _toast('この多角形の色と一致しないため追加できません');
           return;
         }
-        _addPinAndAttach(path, photoPosition, colorIds, target);
+        _addPinAndAttach(
+          result.photoPath,
+          result.position,
+          result.takenAt,
+          result.colorIds,
+          target,
+        );
         _toast('既存の多角形にピンを追加しました');
       }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('撮影に失敗: $e')));
+      ).showSnackBar(SnackBar(content: Text('追加に失敗: $e')));
     }
   }
 
@@ -695,13 +687,14 @@ class _MapScreenState extends State<MapScreen> {
   void _addPinAndAttach(
     String path,
     LatLng pos,
+    DateTime takenAt,
     List<int> colorIds,
     WalkPolygon group,
   ) {
     final pin = PhotoPin(
       imagePath: path,
       position: pos,
-      takenAt: DateTime.now(),
+      takenAt: takenAt,
       colorIds: colorIds,
       ownerUid: _myProfile?.uid,
       polygonId: group.id,
@@ -785,50 +778,6 @@ class _MapScreenState extends State<MapScreen> {
         builder: (_) => ColorCollageScreen(photoPins: _photoPins),
       ),
     );
-  }
-
-  // ─── ギャラリーからEXIF位置情報を読み込んでピンを追加 ───
-  Future<void> _importFromGallery() async {
-    try {
-      final points = await ExifService.getLocationsFromGallery();
-      if (points.isEmpty) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('位置情報のある写真が見つかりませんでした')),
-        );
-        return;
-      }
-      if (!mounted) return;
-
-      // 各写真の主要色を抽出してからピンを追加
-      final List<PhotoPin> newPins = [];
-      for (final p in points) {
-        final path = p.imagePath ?? '';
-        final colorIds = path.isNotEmpty
-            ? await extractColorIdsFromPath(path)
-            : <int>[];
-        newPins.add(PhotoPin(
-          imagePath: path,
-          position: LatLng(p.latitude, p.longitude),
-          takenAt: p.timestamp ?? DateTime.now(),
-          colorIds: colorIds,
-        ));
-      }
-
-      if (!mounted) return;
-      setState(() {
-        _photoPins.addAll(newPins);
-      });
-      _savePhotoPins();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${points.length}件の位置情報を読み込みました')),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('読み込み失敗: $e')),
-      );
-    }
   }
 
   // ─── 写真ピンをCSVエクスポート ───
@@ -1180,14 +1129,6 @@ class _MapScreenState extends State<MapScreen> {
             child: const Icon(Icons.palette_outlined),
           ),
           const SizedBox(height: 8),
-          // ギャラリーからEXIF読み込み
-          FloatingActionButton.small(
-            onPressed: _importFromGallery,
-            heroTag: 'exif_import',
-            tooltip: 'ギャラリーから読み込み',
-            child: const Icon(Icons.perm_media_outlined),
-          ),
-          const SizedBox(height: 8),
           // 写真一覧
           FloatingActionButton.small(
             onPressed: _openPhotoList,
@@ -1195,14 +1136,16 @@ class _MapScreenState extends State<MapScreen> {
             child: const Icon(Icons.photo_library_outlined),
           ),
           const SizedBox(height: 8),
-          // 写真撮影(再生モード中は隠す)
-          if (_mode != MapMode.animation)
-            FloatingActionButton.small(
-              onPressed: _takePhoto,
-              heroTag: 'photo_take',
-              child: const Icon(Icons.camera_alt),
+          // 多角形を作る(通常モード・対戦モードのみ。撮影/ライブラリ統合)
+          if (_mode == MapMode.normal || _mode == MapMode.versus) ...[
+            FloatingActionButton(
+              onPressed: _openCreatePolygonFlow,
+              heroTag: 'create_polygon',
+              tooltip: '多角形を作る',
+              child: const Icon(Icons.brush),
             ),
-          if (_mode != MapMode.animation) const SizedBox(height: 8),
+            const SizedBox(height: 8),
+          ],
           // 現在地に戻る
           FloatingActionButton.small(
             onPressed: _hasLocation
