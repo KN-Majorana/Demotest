@@ -19,25 +19,40 @@ class RankingEntry {
 }
 
 /// 対戦モードの「面積ランキング」を集計するサービス。
+///
+/// v3 以降、領域の上書きは多角形の幾何（rings/holes）そのものに反映されて
+/// いるため、実効面積は「現在の幾何の面積」を素直に計算するだけでよい：
+///   effectiveArea = Σ area(rings) − Σ area(holes)
 class AreaRankingService {
   AreaRankingService._();
 
-  /// [visible]（自分＋フレンドの確定多角形）から
+  /// 多角形の実効面積（外周リング合計 − 穴合計）を返す。
+  static double regionArea(WalkPolygon p) {
+    double area = 0;
+    for (final ring in p.rings) {
+      area += PolygonOverlapService.areaMeters(ring);
+    }
+    for (final hl in p.holes) {
+      for (final hole in hl) {
+        area -= PolygonOverlapService.areaMeters(hole);
+      }
+    }
+    return area < 0 ? 0 : area;
+  }
+
+  /// [visible]（自分＋フレンドの確定・active 多角形）から
   /// 「所有者 × 色」ごとに実効面積を合算し、降順ランキングを返す。
-  ///
-  /// 機能2の上書き（より新しい多角形が古い多角形を奪う）を
-  /// [PolygonOverlapService.effectiveAreaMeters] で反映する。
   static List<RankingEntry> rank(
     List<WalkPolygon> visible, {
     int topN = 20,
   }) {
-    final confirmed = visible.where((p) => p.confirmed).toList();
+    final target =
+        visible.where((p) => p.confirmed && p.isActive).toList();
 
-    // (ownerUid|colorId) -> 集計
     final Map<String, _Agg> byKey = {};
 
-    for (final poly in confirmed) {
-      final eff = PolygonOverlapService.effectiveAreaMeters(poly, confirmed);
+    for (final poly in target) {
+      final eff = regionArea(poly);
       if (eff <= 0) continue;
       final key = '${poly.ownerUid}|${poly.colorId}';
       final agg = byKey.putIfAbsent(
@@ -45,7 +60,6 @@ class AreaRankingService {
         () => _Agg(poly.ownerUid, poly.ownerName, poly.colorId),
       );
       agg.area += eff;
-      // 表示名は最新のもので上書き（空なら維持）
       if (poly.ownerName.isNotEmpty) agg.ownerName = poly.ownerName;
     }
 

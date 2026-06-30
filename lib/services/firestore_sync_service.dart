@@ -155,6 +155,27 @@ class FirestoreSyncService {
     await _polygons.doc(polygonId).delete();
   }
 
+  /// 機能2(v3)：減算後の多角形ジオメトリを書き戻す。
+  /// フレンドの B でも更新できるよう、セキュリティルールで polygons の
+  /// update は認証済みなら許可している（README 参照）。
+  /// 競合に備えてトランザクションで上書きする。
+  static Future<void> updatePolygonGeometry(WalkPolygon polygon) async {
+    final ref = _polygons.doc(polygon.id);
+    await _db.runTransaction((tx) async {
+      tx.set(
+        ref,
+        {
+          'rings': polygon.toMap()['rings'],
+          'holes': polygon.toMap()['holes'],
+          'status': polygon.status,
+          'lastModifiedAt': polygon.lastModifiedAt?.millisecondsSinceEpoch,
+          'subtractedBy': polygon.subtractedBy,
+        },
+        SetOptions(merge: true),
+      );
+    });
+  }
+
   // ─────────────────────────────────────────
   // 写真メタ（photos）
   // ─────────────────────────────────────────
