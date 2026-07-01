@@ -19,25 +19,35 @@ class RankingEntry {
 }
 
 /// 対戦モードの「面積ランキング」を集計するサービス。
+///
+/// v3 以降、領域の上書きは多角形の幾何（rings/holes）そのものに反映されて
+/// いるため、実効面積は「現在の幾何の面積」を素直に計算するだけでよい：
+///   effectiveArea = Σ area(rings) − Σ area(holes)
 class AreaRankingService {
   AreaRankingService._();
 
-  /// [visible]（自分＋フレンドの確定多角形）から
+  /// 多角形の実効面積（外周 − 穴合計）を返す。
+  static double regionArea(WalkPolygon p) {
+    double area = PolygonOverlapService.areaMeters(p.vertices);
+    for (final hole in p.holes) {
+      area -= PolygonOverlapService.areaMeters(hole);
+    }
+    return area < 0 ? 0 : area;
+  }
+
+  /// [visible]（自分＋フレンドの確定・active 多角形）から
   /// 「所有者 × 色」ごとに実効面積を合算し、降順ランキングを返す。
-  ///
-  /// 機能2の上書き（より新しい多角形が古い多角形を奪う）を
-  /// [PolygonOverlapService.effectiveAreaMeters] で反映する。
   static List<RankingEntry> rank(
     List<WalkPolygon> visible, {
     int topN = 20,
   }) {
-    final confirmed = visible.where((p) => p.confirmed).toList();
+    final target =
+        visible.where((p) => p.confirmed && p.isActive).toList();
 
-    // (ownerUid|colorId) -> 集計
     final Map<String, _Agg> byKey = {};
 
-    for (final poly in confirmed) {
-      final eff = PolygonOverlapService.effectiveAreaMeters(poly, confirmed);
+    for (final poly in target) {
+      final eff = regionArea(poly);
       if (eff <= 0) continue;
       final key = '${poly.ownerUid}|${poly.colorId}';
       final agg = byKey.putIfAbsent(
@@ -45,7 +55,6 @@ class AreaRankingService {
         () => _Agg(poly.ownerUid, poly.ownerName, poly.colorId),
       );
       agg.area += eff;
-      // 表示名は最新のもので上書き（空なら維持）
       if (poly.ownerName.isNotEmpty) agg.ownerName = poly.ownerName;
     }
 
@@ -70,4 +79,44 @@ class _Agg {
   final int colorId;
   double area = 0.0;
   _Agg(this.ownerUid, this.ownerName, this.colorId);
+}
+
+/// 1v1 スコア（プレイヤー1人分）
+class BattleScore {
+  final String uid;
+  double areaMeters;
+  int polygonCount;
+  int stealCount; // 相手を削り取った回数（近似）
+  BattleScore(this.uid)
+      : areaMeters = 0,
+        polygonCount = 0,
+        stealCount = 0;
+}
+
+/// battle スコープの多角形から、各プレイヤーのスコアを集計する。
+Map<String, BattleScore> computeBattleScores(List<WalkPolygon> polys) {
+  final confirmed =
+      polys.where((p) => p.confirmed && p.isActive).toList();
+
+  // polygonId -> ownerUid（減算元の所有者を引くため）
+  final idOwner = <String, String>{
+    for (final p in confirmed) p.id: p.ownerUid,
+  };
+
+  final scores = <String, BattleScore>{};
+  BattleScore scoreOf(String uid) =>
+      scores.putIfAbsent(uid, () => BattleScore(uid));
+
+  for (final p in confirmed) {
+    final s = scoreOf(p.ownerUid);
+    s.areaMeters += AreaRankingService.regionArea(p);
+    s.polygonCount += 1;
+    // 削り取り: この多角形を削った A の所有者に加算（近似）
+    final by = p.subtractedBy;
+    if (by != null) {
+      final subtractorUid = idOwner[by];
+      if (subtractorUid != null) scoreOf(subtractorUid).stealCount += 1;
+    }
+  }
+  return scores;
 }

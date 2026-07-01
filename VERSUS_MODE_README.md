@@ -65,23 +65,22 @@ service cloud.firestore {
       }
     }
 
-    // 多角形: 書き込みは ownerUid == 自分のときのみ。読み取りは認証済みなら可
-    // （フレンド限定の描画はクライアント側でフィルタ）。
+    // 多角形（機能2 v4）:
+    //   領域奪取では A の所有者が B（他人）の多角形を「分裂 → 元B削除 +
+    //   B1..Bn を ownerUid=B で新規作成」する必要がある。そのため
+    //   create / update / delete を「認証済みなら誰でも可」に緩めている。
+    //   ゲーム性のためのトレードオフ。読み取りは認証済みなら可。
     match /polygons/{polygonId} {
       allow read: if request.auth != null;
-      allow create, update: if request.auth != null
-        && request.resource.data.ownerUid == request.auth.uid;
-      allow delete: if request.auth != null
-        && resource.data.ownerUid == request.auth.uid;
+      allow create, update, delete: if request.auth != null;
     }
 
-    // 写真メタ: 同上
+    // 写真メタ（機能2 v4）:
+    //   分裂時に A が B の写真の polygonId 付け替え / 削除を行うため、
+    //   同様に認証済みなら書き込み可とする。
     match /photos/{photoId} {
       allow read: if request.auth != null;
-      allow create, update: if request.auth != null
-        && request.resource.data.ownerUid == request.auth.uid;
-      allow delete: if request.auth != null
-        && resource.data.ownerUid == request.auth.uid;
+      allow create, update, delete: if request.auth != null;
     }
   }
 }

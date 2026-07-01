@@ -6,6 +6,15 @@ import 'map_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 捕捉されない非同期エラーでアプリ全体が落ちるのを防ぐ安全網。
+  // （対戦モードの Firestore リスナー等で想定外のエラーが出ても、
+  //   ログに出してアプリは継続させる。）
+  WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+    debugPrint('未捕捉エラー: $error\n$stack');
+    return true; // handled
+  };
+
   try {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
