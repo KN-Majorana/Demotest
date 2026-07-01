@@ -1,0 +1,52 @@
+// Firestore セキュリティルール（対戦モード単独化）
+//
+// - users/{uid}                                 : 本人のみ書き込み可
+// - users/{uid}/friends/{friendUid}             : 本人のみ読み書き
+// - battles/{battleId}                          : 参加者（challenger / opponent）のみ
+//     match /polygons/{polygonId}               : 参加者は読取可、ownerUid のみ書込
+//     match /photos/{photoId}                   : 参加者は読取可、ownerUid のみ書込
+//
+// ★ Cloud Storage ルールは無し（firebase_storage は使用禁止）。
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── ユーザプロファイル ───
+    match /users/{uid} {
+      // 誰でもコード検索できるように読取は許可（フレンド追加用）
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == uid;
+
+      match /friends/{friendUid} {
+        allow read, write: if request.auth != null && request.auth.uid == uid;
+      }
+    }
+
+    // ─── 対戦（battle） ───
+    match /battles/{battleId} {
+      allow read, update: if request.auth != null && request.auth.uid in
+        [resource.data.challengerUid, resource.data.opponentUid];
+      allow create: if request.auth != null &&
+        request.auth.uid == request.resource.data.challengerUid;
+      allow delete: if request.auth != null && request.auth.uid in
+        [resource.data.challengerUid, resource.data.opponentUid];
+
+      match /polygons/{polygonId} {
+        allow read: if request.auth != null && request.auth.uid in
+          [get(/databases/$(database)/documents/battles/$(battleId)).data.challengerUid,
+           get(/databases/$(database)/documents/battles/$(battleId)).data.opponentUid];
+        allow write: if request.auth != null &&
+          request.auth.uid == request.resource.data.ownerUid;
+      }
+
+      match /photos/{photoId} {
+        allow read: if request.auth != null && request.auth.uid in
+          [get(/databases/$(database)/documents/battles/$(battleId)).data.challengerUid,
+           get(/databases/$(database)/documents/battles/$(battleId)).data.opponentUid];
+        allow write: if request.auth != null &&
+          request.auth.uid == request.resource.data.ownerUid;
+      }
+    }
+  }
+}
