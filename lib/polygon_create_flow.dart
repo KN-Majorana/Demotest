@@ -8,23 +8,20 @@ import 'photo_service.dart';
 import 'services/exif_service.dart';
 import 'widgets/create_method_sheet.dart';
 import 'widgets/color_pick_sheet.dart';
-import 'widgets/existing_polygon_pick_sheet.dart';
 import 'widgets/photo_source_sheet.dart';
 
 enum PolygonCreateKind { createNew, addExisting }
 
 /// 多角形作成フロー（ステップ A→B→C→D）の結果。
 ///
-/// 色判定（colorIds）まで済ませた状態で返す。最終的な「色一致チェックと
-/// ピン確定」は呼び出し側（map_screen）の状態を使って行う。
+/// v4: 新規作成・既存追加のどちらも「色（colorId）」を選ぶ形に統一。
+/// 既存追加時に「どの多角形へ追加するか」は呼び出し側（map_screen）が
+/// 写真位置から自動選択する。
 class PolygonCreateResult {
   final PolygonCreateKind kind;
 
-  /// createNew のとき選んだ色（colorPalette24 のインデックス）
-  final int? colorId;
-
-  /// addExisting のとき選んだ多角形
-  final WalkPolygon? target;
+  /// 選んだ色（colorPalette24 のインデックス）
+  final int colorId;
 
   final String photoPath;
 
@@ -34,13 +31,12 @@ class PolygonCreateResult {
   final LatLng position;
   final DateTime takenAt;
 
-  /// ライブラリ選択時に EXIF が無く、現在地/現在時刻にフォールバックしたか
+  /// ライブラリ選択時に EXIF が無く現在地/現在時刻へフォールバックしたか
   final bool usedLocationFallback;
 
   const PolygonCreateResult({
     required this.kind,
     required this.colorId,
-    required this.target,
     required this.photoPath,
     required this.colorIds,
     required this.position,
@@ -50,8 +46,6 @@ class PolygonCreateResult {
 }
 
 /// ステップ A→B→C→D を順に進める状態機械。
-///
-/// 途中でキャンセル/閉じられた場合は null を返す（取得済み写真は破棄する）。
 class PolygonCreateFlow {
   PolygonCreateFlow._();
 
@@ -60,28 +54,42 @@ class PolygonCreateFlow {
     required List<WalkPolygon> myConfirmedPolygons,
     required LatLng currentPosition,
   }) async {
+    // 自分が所有する色 → 個数
+    final ownedCounts = <int, int>{};
+    for (final p in myConfirmedPolygons) {
+      if (!p.confirmed || !p.isActive) continue;
+      ownedCounts[p.colorId] = (ownedCounts[p.colorId] ?? 0) + 1;
+    }
+    final hasExisting = ownedCounts.isNotEmpty;
+
     // ── ステップ A：作成方法 ──
     final method = await CreateMethodSheet.show(
       context,
-      hasExisting: myConfirmedPolygons.isNotEmpty,
+      hasExisting: hasExisting,
     );
     if (method == null || !context.mounted) return null;
 
     int? colorId;
-    WalkPolygon? target;
 
     if (method == PolygonCreateMethod.createNew) {
-      // ── ステップ B-①：色選択 ──
-      colorId = await ColorPickSheet.show(context);
-      if (colorId == null || !context.mounted) return null;
-    } else {
-      // ── ステップ B-②：既存多角形の選択 ──
-      target = await ExistingPolygonPickSheet.show(
+      // ── ステップ B-①：色選択（全24色）──
+      colorId = await ColorPickSheet.show(
         context,
-        polygons: myConfirmedPolygons,
+        title: '多角形の色を選ぶ',
+        subtitle: 'この色と一致する写真だけがピンになります。',
       );
-      if (target == null || !context.mounted) return null;
+    } else {
+      // ── ステップ B-②(v4)：所有色のみから選択 ──
+      final owned = ownedCounts.keys.toList()..sort();
+      colorId = await ColorPickSheet.show(
+        context,
+        title: '追加する色を選ぶ',
+        subtitle: '選んだ色の多角形のうち、写真に最も近いものへ追加されます。',
+        allowedColorIds: owned,
+        colorCounts: ownedCounts,
+      );
     }
+    if (colorId == null || !context.mounted) return null;
 
     // ── ステップ C：写真取得元 ──
     final source = await PhotoSourceSheet.show(context);
@@ -94,18 +102,14 @@ class PolygonCreateFlow {
     bool usedFallback = false;
 
     if (source == PhotoSource.camera) {
-      // 撮影：現在地・現在時刻
       try {
         position = await LocationService.getCurrentPosition();
-      } catch (_) {
-        // 取得できなければ渡された現在地を使う
-      }
+      } catch (_) {}
       path = await PhotoService.takeAndSavePhoto();
-      if (path == null) return null; // キャンセル
+      if (path == null) return null;
     } else {
-      // ライブラリ：EXIF から GPS / 撮影日時を取得、無ければフォールバック
       path = await PhotoService.pickFromGalleryAndSave();
-      if (path == null) return null; // キャンセル
+      if (path == null) return null;
 
       final exif = await ExifService.readExifForFile(path);
       if (exif.lat != null && exif.lng != null) {
@@ -128,7 +132,6 @@ class PolygonCreateFlow {
           ? PolygonCreateKind.createNew
           : PolygonCreateKind.addExisting,
       colorId: colorId,
-      target: target,
       photoPath: path,
       colorIds: colorIds,
       position: position,

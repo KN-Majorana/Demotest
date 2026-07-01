@@ -34,6 +34,7 @@ import 'services/export_service.dart';
 import 'services/firebase_auth_service.dart';
 import 'services/firestore_sync_service.dart';
 import 'services/photo_pin_storage_service.dart';
+import 'services/polygon_clip_service.dart';
 import 'services/polygon_overlap_service.dart';
 import 'services/polygon_storage_service.dart';
 import 'services/storage_upload_service.dart';
@@ -88,14 +89,20 @@ class _MapScreenState extends State<MapScreen> {
   StreamSubscription<List<WalkPolygon>>? _polygonSub;
   StreamSubscription<List<FriendProfile>>? _friendSub;
 
+  // reconcile 用：直近で「Firestore 上に自分の確定多角形として存在した」ID 群。
+  // 前回あって今回無い ID は、他プレイヤーの減算で分裂/消滅したと判断する。
+  Set<String> _seenRemoteMineIds = {};
+
   bool get _isRecording => _currentTrack != null && _currentTrack!.isActive;
 
   /// 対戦モードで描画・集計する多角形（自分の確定分＋フレンドの確定分）。
   List<WalkPolygon> get _visiblePolygons {
     final friendUids = _friends.map((f) => f.uid).toSet();
-    final mine = _myPolygons.where((p) => p.confirmed).toList();
+    final mine =
+        _myPolygons.where((p) => p.confirmed && p.isActive).toList();
     final fromFriends = _remotePolygons.where((p) =>
         p.confirmed &&
+        p.isActive &&
         friendUids.contains(p.ownerUid) &&
         p.ownerUid != _myProfile?.uid);
     return [...mine, ...fromFriends];
@@ -273,13 +280,24 @@ class _MapScreenState extends State<MapScreen> {
   void _deletePhotoPin(PhotoPin pin) {
     setState(() {
       _photoPins.removeWhere((p) => p.id == pin.id);
-      // 所属多角形の頂点を再計算（準備中に戻る場合もある）
+      // 所属多角形の頂点を再計算（3点未満なら共有から削除、以上なら作り直し）
       if (pin.polygonId != null) {
         _recomputeGroup(pin.polygonId!);
       }
     });
     _savePhotoPins();
     _saveMyPolygons();
+    _deleteRemotePhoto(pin.id);
+  }
+
+  /// 対戦参加中なら、削除した写真の Firestore メタと Storage 実体も削除する。
+  void _deleteRemotePhoto(String photoId) {
+    if (!_versusJoined) return;
+    FirestoreSyncService.deletePhoto(photoId);
+    final uid = _myProfile?.uid;
+    if (uid != null) {
+      StorageUploadService.deletePhoto(ownerUid: uid, photoId: photoId);
+    }
   }
 
   /// 指定 ID の多角形を、現在のメンバーピンから再計算する。
@@ -289,16 +307,25 @@ class _MapScreenState extends State<MapScreen> {
     final members =
         _photoPins.where((p) => p.polygonId == polygonId).toList();
     final positions = members.map((p) => p.position).toList();
+    final hull = PolygonOverlapService.convexHull(positions);
     var g = _myPolygons[idx].copyWith(
       photoIds: members.map((p) => p.id).toList(),
-      vertices: PolygonOverlapService.convexHull(positions),
+      vertices: hull,
+      holes: const <List<LatLng>>[],
     );
     if (members.length < 3) {
       g = g.copyWith(confirmed: false);
     }
     _myPolygons[idx] = g;
-    if (g.confirmed && _versusJoined) {
-      _syncPolygonUp(g);
+
+    if (_versusJoined) {
+      if (g.confirmed && g.isActive && g.vertices.length >= 3) {
+        // 残りピンで作り直した基本形を共有に反映
+        _syncPolygonUp(g);
+      } else {
+        // 写真削除で3点未満になった → 共有から多角形を削除
+        FirestoreSyncService.deletePolygon(g.id);
+      }
     }
   }
 
@@ -503,22 +530,36 @@ class _MapScreenState extends State<MapScreen> {
   void _subscribeVersus() {
     _polygonSub?.cancel();
     _friendSub?.cancel();
-    _polygonSub = FirestoreSyncService.watchAllPolygons().listen((all) {
-      if (!mounted) return;
-      setState(() {
-        _remotePolygons
-          ..clear()
-          ..addAll(all);
-      });
-    });
-    _friendSub = FirestoreSyncService.watchFriends().listen((friends) {
-      if (!mounted) return;
-      setState(() {
-        _friends
-          ..clear()
-          ..addAll(friends);
-      });
-    });
+    _polygonSub = FirestoreSyncService.watchAllPolygons().listen(
+      (all) {
+        if (!mounted) return;
+        setState(() {
+          _remotePolygons
+            ..clear()
+            ..addAll(all);
+          // 自分の確定多角形を Firestore の状態に合わせる（分裂/消滅の反映）
+          _reconcileMyPolygons();
+        });
+        _saveMyPolygons();
+        _savePhotoPins();
+      },
+      onError: (Object e) {
+        debugPrint('polygons購読エラー: $e');
+      },
+    );
+    _friendSub = FirestoreSyncService.watchFriends().listen(
+      (friends) {
+        if (!mounted) return;
+        setState(() {
+          _friends
+            ..clear()
+            ..addAll(friends);
+        });
+      },
+      onError: (Object e) {
+        debugPrint('friends購読エラー: $e');
+      },
+    );
   }
 
   void _unsubscribeVersus() {
@@ -526,6 +567,74 @@ class _MapScreenState extends State<MapScreen> {
     _polygonSub = null;
     _friendSub?.cancel();
     _friendSub = null;
+  }
+
+  /// 自分の確定多角形を Firestore の状態に合わせる。
+  /// 他プレイヤーの減算で B が分裂/消滅した結果（B1..Bn の作成、元 B の削除）を
+  /// ローカルへ反映し、ローカルピンの polygonId も付け替える。
+  /// ※ setState の中から呼ぶこと（リストを直接変更する）。
+  void _reconcileMyPolygons() {
+    final myUid = _myProfile?.uid;
+    if (myUid == null) return;
+
+    final remoteMine = _remotePolygons
+        .where((p) => p.ownerUid == myUid && p.confirmed && p.isActive)
+        .toList();
+    final remoteIds = remoteMine.map((p) => p.id).toSet();
+
+    // 1) 追加＆更新：Firestore にある自分の確定多角形をローカルへ反映
+    for (final rp in remoteMine) {
+      final i = _myPolygons.indexWhere((p) => p.id == rp.id);
+      if (i < 0) {
+        _myPolygons.add(rp);
+      } else {
+        _myPolygons[i] = rp; // 幾何を Firestore 側に合わせる
+      }
+    }
+
+    // 2) 削除：以前 Firestore にあった自分の確定多角形が消えた → 分裂/消滅
+    final removed = _myPolygons
+        .where((lp) =>
+            lp.confirmed &&
+            (lp.ownerUid == myUid || lp.ownerUid == 'local') &&
+            _seenRemoteMineIds.contains(lp.id) &&
+            !remoteIds.contains(lp.id))
+        .toList();
+    for (final lp in removed) {
+      _myPolygons.removeWhere((p) => p.id == lp.id);
+      _reassignPinsAfterRemoval(lp, remoteMine);
+    }
+
+    _seenRemoteMineIds = remoteIds;
+  }
+
+  /// 消滅/分裂した多角形 [removed] に属していたローカルピンを、
+  /// 新しいピース（[remoteMine]）へ付け替える。どこにも入らない＝奪われた
+  /// ピンはローカルからも削除する。
+  void _reassignPinsAfterRemoval(
+    WalkPolygon removed,
+    List<WalkPolygon> remoteMine,
+  ) {
+    final affected =
+        _photoPins.where((p) => p.polygonId == removed.id).toList();
+    for (final pin in affected) {
+      WalkPolygon? host;
+      for (final rp in remoteMine) {
+        if (rp.vertices.length >= 3 &&
+            PolygonClipService.pointInRing(pin.position, rp.vertices)) {
+          host = rp;
+          break;
+        }
+      }
+      if (host != null) {
+        final i = _photoPins.indexWhere((p) => p.id == pin.id);
+        if (i >= 0) _photoPins[i] = pin.copyWith(polygonId: host.id);
+      } else {
+        // どの多角形にも入らない → 奪われて消えた写真。ローカルからも削除。
+        _photoPins.removeWhere((p) => p.id == pin.id);
+        PhotoService.deletePhotoFile(pin.imagePath);
+      }
+    }
   }
 
   /// 多角形（と構成写真）を Firestore / Storage に同期（ベストエフォート）。
@@ -605,7 +714,8 @@ class _MapScreenState extends State<MapScreen> {
     try {
       final result = await PolygonCreateFlow.run(
         context,
-        myConfirmedPolygons: _myPolygons.where((p) => p.confirmed).toList(),
+        myConfirmedPolygons:
+            _myPolygons.where((p) => p.confirmed && p.isActive).toList(),
         currentPosition: _currentPosition,
       );
       if (result == null) return; // キャンセル（写真はフロー内で破棄済み）
@@ -616,8 +726,8 @@ class _MapScreenState extends State<MapScreen> {
       }
 
       // ── ステップ D（後半）：色一致チェックとピン確定 ──
+      final colorId = result.colorId;
       if (result.kind == PolygonCreateKind.createNew) {
-        final colorId = result.colorId!;
         if (!result.colorIds.contains(colorId)) {
           await PhotoService.deletePhotoFile(result.photoPath); // 破棄
           _toast('指定した色と一致しないため追加できません');
@@ -636,20 +746,13 @@ class _MapScreenState extends State<MapScreen> {
             colorId < colorNames24.length ? colorNames24[colorId] : '';
         _toast('「$name」の多角形にピンを追加しました');
       } else {
-        final target = result.target!;
-        if (!result.colorIds.contains(target.colorId)) {
+        // 既存追加(v4): 色一致チェック → 対象は自動選択
+        if (!result.colorIds.contains(colorId)) {
           await PhotoService.deletePhotoFile(result.photoPath); // 破棄
           _toast('この多角形の色と一致しないため追加できません');
           return;
         }
-        _addPinAndAttach(
-          result.photoPath,
-          result.position,
-          result.takenAt,
-          result.colorIds,
-          target,
-        );
-        _toast('既存の多角形にピンを追加しました');
+        _addToExistingByColor(result);
       }
     } catch (e) {
       if (!mounted) return;
@@ -676,6 +779,7 @@ class _MapScreenState extends State<MapScreen> {
       ownerName: _myProfile?.displayName ?? '',
       colorId: colorId,
       vertices: const [],
+      holes: const [],
       createdAt: null,
       photoIds: const [],
       confirmed: false,
@@ -708,13 +812,16 @@ class _MapScreenState extends State<MapScreen> {
       pos,
     ];
 
+    final hull = PolygonOverlapService.convexHull(positions);
     var g = group.copyWith(
       photoIds: [...group.photoIds, pin.id],
-      vertices: PolygonOverlapService.convexHull(positions),
+      vertices: hull,
+      holes: const <List<LatLng>>[],
     );
 
     // 3 枚目で確定
-    if (!g.confirmed && g.photoIds.length >= 3) {
+    final justConfirmed = !g.confirmed && g.photoIds.length >= 3;
+    if (justConfirmed) {
       g = g.copyWith(
         confirmed: true,
         createdAt: DateTime.now(),
@@ -733,7 +840,96 @@ class _MapScreenState extends State<MapScreen> {
 
     if (g.confirmed && _versusJoined) {
       _syncPolygonUp(g);
+      // 機能2(v4): 確定した A で、より古い B 群を減算（分裂なら独立Doc化）
+      if (justConfirmed && _mode == MapMode.versus) {
+        _applyOverrideOnConfirm(g);
+      }
     }
+  }
+
+  /// A が確定したとき、より古く重なる B 群に減算を適用する（Firestore 書き戻し）。
+  Future<void> _applyOverrideOnConfirm(WalkPolygon a) async {
+    if (!_versusJoined || a.createdAt == null) return;
+    final candidates = _remotePolygons
+        .where((p) =>
+            p.id != a.id &&
+            p.confirmed &&
+            p.isActive &&
+            p.createdAt != null &&
+            a.createdAt!.isAfter(p.createdAt!))
+        .toList();
+    try {
+      await FirestoreSyncService.applyOverride(a: a, candidates: candidates);
+    } catch (_) {}
+  }
+
+  /// 既存追加(v4)：色 C の自分の多角形のうち、写真位置に最も近いものへ頂点追加。
+  void _addToExistingByColor(PolygonCreateResult result) {
+    final c = result.colorId;
+    final candidates = _myPolygons
+        .where((p) =>
+            p.confirmed &&
+            p.isActive &&
+            p.colorId == c &&
+            p.vertices.isNotEmpty)
+        .toList();
+    if (candidates.isEmpty) {
+      PhotoService.deletePhotoFile(result.photoPath);
+      _toast('対象の多角形が見つかりません');
+      return;
+    }
+
+    WalkPolygon? target;
+    double best = double.infinity;
+    for (final p in candidates) {
+      double d = double.infinity;
+      for (final v in p.vertices) {
+        final dx = v.longitude - result.position.longitude;
+        final dy = v.latitude - result.position.latitude;
+        final sq = dx * dx + dy * dy;
+        if (sq < d) d = sq;
+      }
+      if (d < best) {
+        best = d;
+        target = p;
+      } else if (d == best &&
+          target != null &&
+          (p.createdAt?.isAfter(target.createdAt ?? DateTime(0)) ?? false)) {
+        target = p;
+      }
+    }
+    if (target == null) {
+      PhotoService.deletePhotoFile(result.photoPath);
+      _toast('対象の多角形が見つかりません');
+      return;
+    }
+
+    final pin = PhotoPin(
+      imagePath: result.photoPath,
+      position: result.position,
+      takenAt: result.takenAt,
+      colorIds: result.colorIds,
+      ownerUid: _myProfile?.uid,
+      polygonId: target.id,
+    );
+    final newHull = PolygonOverlapService.convexHull(
+      [...target.vertices, result.position],
+    );
+    final updated = target.copyWith(
+      vertices: newHull,
+      photoIds: [...target.photoIds, pin.id],
+      lastModifiedAt: DateTime.now(),
+    );
+
+    setState(() {
+      _photoPins.add(pin);
+      final i = _myPolygons.indexWhere((p) => p.id == updated.id);
+      if (i >= 0) _myPolygons[i] = updated;
+    });
+    _savePhotoPins();
+    _saveMyPolygons();
+    if (_versusJoined) _syncPolygonUp(updated);
+    _toast('既存の多角形にピンを追加しました');
   }
 
   void _upsertGroup(WalkPolygon g) {
@@ -765,6 +961,9 @@ class _MapScreenState extends State<MapScreen> {
             });
             _savePhotoPins();
             _saveMyPolygons();
+            for (final id in ids) {
+              _deleteRemotePhoto(id);
+            }
           },
         ),
       ),
