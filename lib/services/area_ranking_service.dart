@@ -26,16 +26,11 @@ class RankingEntry {
 class AreaRankingService {
   AreaRankingService._();
 
-  /// 多角形の実効面積（外周リング合計 − 穴合計）を返す。
+  /// 多角形の実効面積（外周 − 穴合計）を返す。
   static double regionArea(WalkPolygon p) {
-    double area = 0;
-    for (final ring in p.rings) {
-      area += PolygonOverlapService.areaMeters(ring);
-    }
-    for (final hl in p.holes) {
-      for (final hole in hl) {
-        area -= PolygonOverlapService.areaMeters(hole);
-      }
+    double area = PolygonOverlapService.areaMeters(p.vertices);
+    for (final hole in p.holes) {
+      area -= PolygonOverlapService.areaMeters(hole);
     }
     return area < 0 ? 0 : area;
   }

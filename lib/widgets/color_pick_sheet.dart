@@ -2,10 +2,23 @@ import 'package:flutter/material.dart';
 
 import '../color_extraction.dart';
 
-/// ステップB-①：新規多角形の色を選ぶ BottomSheet（グリッド表示）。
-/// colorPalette24 のインデックスを返す。キャンセル時は null。
+/// 色を選ぶ BottomSheet（グリッド表示）。
+///
+/// - 新規作成: [allowedColorIds] を null にして全 24 色を表示。
+/// - 既存追加: [allowedColorIds] に「自分が所有する色」だけを渡し、
+///   [colorCounts] でその色の多角形個数を表示する。
 class ColorPickSheet {
-  static Future<int?> show(BuildContext context) {
+  /// 選択された colorPalette24 のインデックスを返す。キャンセル時は null。
+  static Future<int?> show(
+    BuildContext context, {
+    String title = '多角形の色を選ぶ',
+    String? subtitle,
+    List<int>? allowedColorIds,
+    Map<int, int>? colorCounts,
+  }) {
+    final ids = allowedColorIds ??
+        List<int>.generate(colorPalette24.length, (i) => i);
+
     return showModalBottomSheet<int>(
       context: context,
       shape: const RoundedRectangleBorder(
@@ -21,10 +34,10 @@ class ColorPickSheet {
               children: [
                 Row(
                   children: [
-                    const Expanded(
+                    Expanded(
                       child: Text(
-                        '多角形の色を選ぶ',
-                        style: TextStyle(
+                        title,
+                        style: const TextStyle(
                           fontSize: 18,
                           fontWeight: FontWeight.bold,
                         ),
@@ -36,16 +49,21 @@ class ColorPickSheet {
                     ),
                   ],
                 ),
-                const SizedBox(height: 4),
-                const Text(
-                  'この色と一致する写真だけがピンになります。',
-                  style: TextStyle(fontSize: 13, color: Colors.black54),
-                ),
+                if (subtitle != null) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      color: Colors.black54,
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 16),
                 GridView.builder(
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
-                  itemCount: colorPalette24.length,
+                  itemCount: ids.length,
                   gridDelegate:
                       const SliverGridDelegateWithFixedCrossAxisCount(
                     crossAxisCount: 4,
@@ -53,10 +71,14 @@ class ColorPickSheet {
                     crossAxisSpacing: 12,
                     childAspectRatio: 0.8,
                   ),
-                  itemBuilder: (ctx, i) => _ColorChoice(
-                    colorId: i,
-                    onTap: () => Navigator.pop(ctx, i),
-                  ),
+                  itemBuilder: (ctx, i) {
+                    final id = ids[i];
+                    return _ColorChoice(
+                      colorId: id,
+                      count: colorCounts?[id],
+                      onTap: () => Navigator.pop(ctx, id),
+                    );
+                  },
                 ),
               ],
             ),
@@ -69,9 +91,14 @@ class ColorPickSheet {
 
 class _ColorChoice extends StatelessWidget {
   final int colorId;
+  final int? count;
   final VoidCallback onTap;
 
-  const _ColorChoice({required this.colorId, required this.onTap});
+  const _ColorChoice({
+    required this.colorId,
+    required this.onTap,
+    this.count,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -101,7 +128,7 @@ class _ColorChoice extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           Text(
-            name,
+            count != null ? '$name（$count）' : name,
             textAlign: TextAlign.center,
             style: const TextStyle(fontSize: 11),
             overflow: TextOverflow.ellipsis,

@@ -58,45 +58,39 @@ class _VersusPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     for (final poly in polygons) {
       if (!poly.confirmed || !poly.isActive) continue;
-      if (poly.rings.isEmpty) continue;
+      final ring = poly.vertices;
+      if (ring.length < 3) continue;
 
       final pc = poly.colorId >= 0 && poly.colorId < colorPalette24.length
           ? colorPalette24[poly.colorId]
           : const ColorRGB(128, 128, 128);
       final isMine = myUid != null && poly.ownerUid == myUid;
 
-      for (int i = 0; i < poly.rings.length; i++) {
-        final ring = poly.rings[i];
-        if (ring.length < 3) continue;
-
-        // 外周 ＋ 穴（even-odd でくり抜く）
-        final path = Path()..fillType = PathFillType.evenOdd;
-        _addRing(path, ring);
-        if (i < poly.holes.length) {
-          for (final hole in poly.holes[i]) {
-            if (hole.length >= 3) _addRing(path, hole);
-          }
-        }
-
-        // 塗り（幾何が示すままに塗る。重ね合成トリックは使わない）
-        canvas.drawPath(
-          path,
-          Paint()
-            ..color = Color.fromRGBO(pc.r, pc.g, pc.b, isMine ? 0.42 : 0.30)
-            ..style = PaintingStyle.fill,
-        );
-
-        // 外周の枠線
-        final outline = Path();
-        _addRing(outline, ring);
-        canvas.drawPath(
-          outline,
-          Paint()
-            ..color = Color.fromRGBO(pc.r, pc.g, pc.b, 1.0)
-            ..style = PaintingStyle.stroke
-            ..strokeWidth = isMine ? 3.0 : 1.5,
-        );
+      // 外周 ＋ 穴（even-odd でくり抜く）
+      final path = Path()..fillType = PathFillType.evenOdd;
+      _addRing(path, ring);
+      for (final hole in poly.holes) {
+        if (hole.length >= 3) _addRing(path, hole);
       }
+
+      // 塗り（幾何が示すままに塗る。重ね合成トリックは使わない）
+      canvas.drawPath(
+        path,
+        Paint()
+          ..color = Color.fromRGBO(pc.r, pc.g, pc.b, isMine ? 0.42 : 0.30)
+          ..style = PaintingStyle.fill,
+      );
+
+      // 外周の枠線
+      final outline = Path();
+      _addRing(outline, ring);
+      canvas.drawPath(
+        outline,
+        Paint()
+          ..color = Color.fromRGBO(pc.r, pc.g, pc.b, 1.0)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = isMine ? 3.0 : 1.5,
+      );
     }
   }
 

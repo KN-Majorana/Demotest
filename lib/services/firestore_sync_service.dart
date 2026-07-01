@@ -1,10 +1,13 @@
 import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:latlong2/latlong.dart';
 
 import '../models/friend_profile.dart';
 import '../models/polygon.dart';
 import 'firebase_auth_service.dart';
+import 'polygon_clip_service.dart';
+import 'storage_upload_service.dart';
 
 /// Firestore とのデータ同期を担うサービス。
 ///
@@ -168,25 +171,206 @@ class FirestoreSyncService {
     await _polygons.doc(polygonId).delete();
   }
 
-  /// 機能2(v3)：減算後の多角形ジオメトリを書き戻す。
-  /// フレンドの B でも更新できるよう、セキュリティルールで polygons の
-  /// update は認証済みなら許可している（README 参照）。
-  /// 競合に備えてトランザクションで上書きする。
-  static Future<void> updatePolygonGeometry(WalkPolygon polygon) async {
-    final ref = _polygons.doc(polygon.id);
-    await _db.runTransaction((tx) async {
-      tx.set(
-        ref,
-        {
-          'rings': polygon.toMap()['rings'],
-          'holes': polygon.toMap()['holes'],
-          'status': polygon.status,
-          'lastModifiedAt': polygon.lastModifiedAt?.millisecondsSinceEpoch,
-          'subtractedBy': polygon.subtractedBy,
-        },
-        SetOptions(merge: true),
-      );
-    });
+  // ═════════════════════════════════════════════════════════
+  // 機能2(v4)：新規多角形 A による、より古い B 群への減算適用
+  //   - 単一リングに削れる / 穴があく → B ドキュメントをその場更新
+  //   - B が完全に奪われる           → B を物理削除（写真も削除）
+  //   - B が 2 つ以上に分裂           → 元 B を削除し B1..Bn を新規作成
+  //                                     （createdAt は元 B を継承）
+  // 分裂・消滅は WriteBatch で原子的に commit する（失敗時は何も反映されない）。
+  // Cloud Storage の画像削除は batch に含められないため commit 成功後に行い、
+  // 失敗はログのみとする（データ主体は Firestore を優先）。
+  // ═════════════════════════════════════════════════════════
+
+  static Map<String, dynamic> _llm(LatLng v) =>
+      {'lat': v.latitude, 'lng': v.longitude};
+
+  /// A（確定した新規多角形）で [candidates]（A より古い確定 active 多角形）を
+  /// 減算適用する。versus モードでのみ呼ぶこと。
+  static Future<void> applyOverride({
+    required WalkPolygon a,
+    required List<WalkPolygon> candidates,
+  }) async {
+    final aRing = a.vertices;
+    if (aRing.length < 3 || a.createdAt == null) return;
+
+    for (final b in candidates) {
+      try {
+        if (b.id == a.id) continue;
+        if (!b.confirmed || !b.isActive || b.createdAt == null) continue;
+        if (!a.createdAt!.isAfter(b.createdAt!)) continue; // A が新しい時のみ
+        if (!PolygonClipService.regionsOverlap(b.vertices, aRing)) continue;
+
+        final outcome = PolygonClipService.classify(b.vertices, aRing);
+        final now = DateTime.now().millisecondsSinceEpoch;
+
+        switch (outcome.kind) {
+          case SubtractKind.unchanged:
+            break;
+
+          case SubtractKind.updatedSingle:
+            // 角が削れて単一リングのまま → その場更新
+            await _polygons.doc(b.id).set({
+              'vertices': outcome.single!.map(_llm).toList(),
+              'lastModifiedAt': now,
+              'subtractedBy': a.id,
+            }, SetOptions(merge: true));
+            break;
+
+          case SubtractKind.holed:
+            // A が B 内部に完全包含 → 穴を追加（外周は不変）
+            await _polygons.doc(b.id).set({
+              'holes': [
+                {'points': outcome.hole!.map(_llm).toList()}
+              ],
+              'lastModifiedAt': now,
+              'subtractedBy': a.id,
+            }, SetOptions(merge: true));
+            break;
+
+          case SubtractKind.consumed:
+            await _consumeB(b);
+            break;
+
+          case SubtractKind.split:
+            await _splitB(b, outcome.pieces!, aRing, a.id);
+            break;
+        }
+      } catch (_) {
+        // この B の処理に失敗しても他の B は続行（batch内は原子的）
+      }
+    }
+  }
+
+  /// B が A に完全に奪われた場合：B と B の全写真を削除する。
+  static Future<void> _consumeB(WalkPolygon b) async {
+    final photos = await _readPhotos(b.id);
+    final batch = _db.batch();
+    batch.delete(_polygons.doc(b.id));
+    for (final p in photos) {
+      batch.delete(_photos.doc(p.id));
+    }
+    await batch.commit(); // 失敗時は何も反映されない（原子的）
+
+    for (final p in photos) {
+      await StorageUploadService.deletePhoto(
+          ownerUid: p.ownerUid, photoId: p.id);
+    }
+  }
+
+  /// B が分裂した場合：元 B を削除し、各リングを独立ドキュメントとして作成。
+  /// 写真は「どのリングに属するか / A に奪われて消失したか」で引き継ぎ or 削除。
+  static Future<void> _splitB(
+    WalkPolygon b,
+    List<List<LatLng>> pieces,
+    List<LatLng> aRing,
+    String aId,
+  ) async {
+    final photos = await _readPhotos(b.id);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final createdMs = b.createdAt?.millisecondsSinceEpoch;
+
+    // piece ごとの新 ID
+    final refs = List.generate(pieces.length, (_) => _polygons.doc());
+    final assigned = List.generate(pieces.length, (_) => <String>[]);
+    final vanished = <({String id, String ownerUid})>[];
+
+    for (final ph in photos) {
+      // A の内側に入った点 → 消失（奪われた）
+      if (PolygonClipService.pointInRing(ph.pos, aRing)) {
+        vanished.add((id: ph.id, ownerUid: ph.ownerUid));
+        continue;
+      }
+      // それ以外は、内部に含む piece（無ければ最近傍 piece）へ引き継ぎ
+      int target = -1;
+      for (int i = 0; i < pieces.length; i++) {
+        if (PolygonClipService.pointInRing(ph.pos, pieces[i])) {
+          target = i;
+          break;
+        }
+      }
+      if (target < 0) target = _nearestPiece(ph.pos, pieces);
+      if (target >= 0) {
+        assigned[target].add(ph.id);
+      } else {
+        vanished.add((id: ph.id, ownerUid: ph.ownerUid));
+      }
+    }
+
+    final batch = _db.batch();
+    batch.delete(_polygons.doc(b.id));
+    for (int i = 0; i < pieces.length; i++) {
+      batch.set(refs[i], {
+        'id': refs[i].id,
+        'ownerUid': b.ownerUid,
+        'ownerName': b.ownerName,
+        'colorId': b.colorId,
+        'vertices': pieces[i].map(_llm).toList(),
+        'holes': <dynamic>[],
+        'createdAt': createdMs, // 元 B の createdAt を継承（減算判定のため）
+        'lastModifiedAt': now,
+        'subtractedBy': aId,
+        'photoIds': assigned[i],
+        'confirmed': true,
+        'status': 'active',
+      });
+      // 引き継ぐ写真の polygonId を更新
+      for (final pid in assigned[i]) {
+        batch.set(_photos.doc(pid), {'polygonId': refs[i].id},
+            SetOptions(merge: true));
+      }
+    }
+    // 消失した写真は Firestore からも削除
+    for (final v in vanished) {
+      batch.delete(_photos.doc(v.id));
+    }
+
+    await batch.commit(); // 原子的：失敗時は元 B も残り、B1..Bn も作られない
+
+    // commit 成功後に Storage 実体を削除（失敗はログのみ）
+    for (final v in vanished) {
+      await StorageUploadService.deletePhoto(
+          ownerUid: v.ownerUid, photoId: v.id);
+    }
+  }
+
+  static int _nearestPiece(LatLng p, List<List<LatLng>> pieces) {
+    int best = -1;
+    double bestD = double.infinity;
+    for (int i = 0; i < pieces.length; i++) {
+      for (final v in pieces[i]) {
+        final dx = p.longitude - v.longitude;
+        final dy = p.latitude - v.latitude;
+        final d = dx * dx + dy * dy;
+        if (d < bestD) {
+          bestD = d;
+          best = i;
+        }
+      }
+    }
+    return best;
+  }
+
+  /// 指定 polygonId に属する写真の (id, 位置, ownerUid) を読み出す。
+  static Future<List<({String id, LatLng pos, String ownerUid})>> _readPhotos(
+      String polygonId) async {
+    final out = <({String id, LatLng pos, String ownerUid})>[];
+    try {
+      final q =
+          await _photos.where('polygonId', isEqualTo: polygonId).get();
+      for (final d in q.docs) {
+        final m = d.data();
+        final lat = (m['lat'] as num?)?.toDouble();
+        final lng = (m['lng'] as num?)?.toDouble();
+        if (lat == null || lng == null) continue;
+        out.add((
+          id: d.id,
+          pos: LatLng(lat, lng),
+          ownerUid: m['ownerUid'] as String? ?? '',
+        ));
+      }
+    } catch (_) {}
+    return out;
   }
 
   // ─────────────────────────────────────────

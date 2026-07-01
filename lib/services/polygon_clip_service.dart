@@ -2,8 +2,6 @@ import 'dart:math' as math;
 
 import 'package:latlong2/latlong.dart';
 
-import '../models/polygon.dart';
-
 /// 多角形の boolean 減算（B − A）を行う純関数サービス。
 ///
 /// A（クリップ）は凸多角形（ピンの凸包）であることを前提とする。
@@ -21,12 +19,14 @@ import '../models/polygon.dart';
 /// 「変更なし（unchanged）」を返して B を破壊しない。
 ///
 /// ── 使用例 ────────────────────────────────────────────────
-///   final diff = PolygonClipService.differenceRingMinusConvex(bRing, aRing);
-///   if (diff.consumed) { /* B は消滅 */ }
-///   else if (diff.unchanged) { /* 重なりなし、B はそのまま */ }
-///   else { final newRings = diff.outers; final newHoles = diff.holes; }
-///
-///   final updatedB = PolygonClipService.subtract(b, aRing, a.id);
+///   final outcome = PolygonClipService.classify(bVertices, aRing);
+///   switch (outcome.kind) {
+///     case SubtractKind.unchanged: break;         // 重なりなし
+///     case SubtractKind.updatedSingle: ...;       // 単一リングに削れた
+///     case SubtractKind.holed: ...;               // 穴があいた
+///     case SubtractKind.consumed: ...;            // B 消滅
+///     case SubtractKind.split: ...;               // 2 本以上に分裂
+///   }
 /// ─────────────────────────────────────────────────────────
 class PolygonClipService {
   PolygonClipService._();
@@ -38,91 +38,43 @@ class PolygonClipService {
   // 公開 API
   // ─────────────────────────────────────────
 
-  /// WalkPolygon [b] から凸リング [aRing] を減算した新しい WalkPolygon を返す。
-  /// 各外周リングごとに差し引き、既存の穴は新しい外周へ再分配する。
-  static WalkPolygon subtract(WalkPolygon b, List<LatLng> aRing, String aId) {
-    if (aRing.length < 3 || b.rings.isEmpty) return b;
-
-    final newRings = <List<LatLng>>[];
-    final newHoles = <List<List<LatLng>>>[];
-
-    for (int i = 0; i < b.rings.length; i++) {
-      final outer = b.rings[i];
-      final existingHoles =
-          (i < b.holes.length) ? b.holes[i] : const <List<LatLng>>[];
-
-      final diff = differenceRingMinusConvex(outer, aRing);
-
-      if (diff.consumed) {
-        // この外周は完全に奪われた → 穴ごと消滅
-        continue;
-      }
-      if (diff.unchanged) {
-        newRings.add(outer);
-        newHoles.add(List<List<LatLng>>.from(existingHoles));
-        continue;
-      }
-
-      final candidateHoles = <List<LatLng>>[
-        ...existingHoles,
-        ...diff.holes,
-      ];
-      for (final o in diff.outers) {
-        final assigned = <List<LatLng>>[];
-        for (final h in candidateHoles) {
-          if (h.length >= 3 && _centroidInside(h, o)) assigned.add(h);
-        }
-        newRings.add(o);
-        newHoles.add(assigned);
-      }
+  /// 単一リング [bVertices] から凸リング [aRing] を引いた結果を分類して返す。
+  /// firestore_sync_service がこの分類を見て「更新 / 穴あけ / 消滅 / 分裂」を
+  /// 使い分ける。
+  static SubtractOutcome classify(
+    List<LatLng> bVertices,
+    List<LatLng> aRing,
+  ) {
+    if (bVertices.length < 3 || aRing.length < 3) {
+      return const SubtractOutcome.unchanged();
     }
+    final diff = differenceRingMinusConvex(bVertices, aRing);
+    if (diff.unchanged) return const SubtractOutcome.unchanged();
+    if (diff.consumed) return const SubtractOutcome.consumed();
 
-    final consumed = newRings.isEmpty;
-    return b.copyWith(
-      rings: consumed ? const <List<LatLng>>[] : newRings,
-      holes: consumed ? const <List<List<LatLng>>>[] : newHoles,
-      status: consumed ? 'consumed' : 'active',
-      lastModifiedAt: DateTime.now(),
-      subtractedBy: aId,
-    );
+    // A が B 内部に完全包含 → 穴あけ（外周不変）
+    if (diff.holes.isNotEmpty && diff.outers.length == 1) {
+      return SubtractOutcome.holed(diff.holes.first);
+    }
+    // 単一リングに削れた
+    if (diff.outers.length == 1) {
+      return SubtractOutcome.updatedSingle(diff.outers.first);
+    }
+    // 2 つ以上に分裂
+    if (diff.outers.length >= 2) {
+      return SubtractOutcome.split(diff.outers);
+    }
+    return const SubtractOutcome.unchanged();
   }
 
-  /// 表示・集計用：多角形 [p] から、自分より新しく重なる [all] 内の多角形の
-  /// 「素の凸包（基本形 = rings.first）」を順に引いた実効ジオメトリを返す。
-  ///
-  /// データを Firestore に書き戻さず、各端末がこの同じ計算を行うため、
-  /// どの端末でも同一の結果（分裂・くり抜き）になる。
-  static WalkPolygon effectiveGeometry(WalkPolygon p, List<WalkPolygon> all) {
-    if (p.rings.isEmpty || p.createdAt == null) return p;
-
-    final newer = all
-        .where((q) =>
-            q.id != p.id &&
-            q.confirmed &&
-            q.isActive &&
-            q.createdAt != null &&
-            q.createdAt!.isAfter(p.createdAt!))
-        .toList()
-      ..sort((a, b) => a.createdAt!.compareTo(b.createdAt!));
-
-    var region = p;
-    for (final q in newer) {
-      if (q.rings.isEmpty) continue;
-      final aRing = q.rings.first;
-      if (!regionsOverlap(region, aRing)) continue;
-      region = subtract(region, aRing, q.id);
-      if (!region.isActive || region.rings.isEmpty) break;
-    }
-    return region;
+  /// 単一リング B と凸リング A が面積的に重なるかの簡易判定。
+  static bool regionsOverlap(List<LatLng> bVertices, List<LatLng> aRing) {
+    return _ringsOverlap(bVertices, aRing);
   }
 
-  /// B の領域（外周リング群）と凸リング A が面積的に重なるかの簡易判定。
-  static bool regionsOverlap(WalkPolygon b, List<LatLng> aRing) {
-    for (final outer in b.rings) {
-      if (_ringsOverlap(outer, aRing)) return true;
-    }
-    return false;
-  }
+  /// 点 [p] がリング [ring] の内部にあるか（even-odd）。
+  static bool pointInRing(LatLng p, List<LatLng> ring) =>
+      _pointInPolyLL(p, ring);
 
   /// 単一リング [subject] から凸 [clip] を引いた結果。
   static PolyDiffResult differenceRingMinusConvex(
@@ -367,16 +319,6 @@ class PolygonClipService {
     return inside;
   }
 
-  static bool _centroidInside(List<LatLng> ring, List<LatLng> outer) {
-    double sx = 0, sy = 0;
-    for (final p in ring) {
-      sx += p.longitude;
-      sy += p.latitude;
-    }
-    final c = LatLng(sy / ring.length, sx / ring.length);
-    return _pointInPolyLL(c, outer);
-  }
-
   static bool _ringsOverlap(List<LatLng> a, List<LatLng> b) {
     // 頂点包含
     for (final p in a) {
@@ -435,6 +377,33 @@ class PolygonClipService {
     // sum > 0 は時計回り（y上向き平面）→ 反転して CCW に
     return sum > 0 ? ring.reversed.toList() : ring;
   }
+}
+
+/// 減算結果の分類。
+enum SubtractKind { unchanged, updatedSingle, holed, consumed, split }
+
+class SubtractOutcome {
+  final SubtractKind kind;
+
+  /// updatedSingle: 削れた後の単一外周リング
+  final List<LatLng>? single;
+
+  /// holed: 追加する穴（外周は不変）
+  final List<LatLng>? hole;
+
+  /// split: 分裂した各リング（2 本以上）
+  final List<List<LatLng>>? pieces;
+
+  const SubtractOutcome._(this.kind, {this.single, this.hole, this.pieces});
+
+  const SubtractOutcome.unchanged() : this._(SubtractKind.unchanged);
+  const SubtractOutcome.consumed() : this._(SubtractKind.consumed);
+  const SubtractOutcome.updatedSingle(List<LatLng> ring)
+      : this._(SubtractKind.updatedSingle, single: ring);
+  const SubtractOutcome.holed(List<LatLng> h)
+      : this._(SubtractKind.holed, hole: h);
+  const SubtractOutcome.split(List<List<LatLng>> rings)
+      : this._(SubtractKind.split, pieces: rings);
 }
 
 /// 減算結果。
