@@ -32,6 +32,7 @@ import '../services/polygon_clip_service.dart';
 import 'dialogs/force_end_confirm_dialog.dart';
 import 'versus_lobby_screen.dart';
 import 'versus_result_screen.dart';
+import 'widgets/versus_polygons_overlay.dart';
 
 class VersusBattleScreen extends StatefulWidget {
   final String battleId;
@@ -558,22 +559,6 @@ class _VersusBattleScreenState extends State<VersusBattleScreen> {
     final displayRemain =
         remaining.isNegative ? Duration.zero : remaining;
 
-    // ── 多角形レイヤ ──
-    final polygonWidgets = <Polygon>[];
-    for (final p in _polygons) {
-      if (!p.isActive || p.vertices.length < 3) continue;
-      final c = _colorFromId(p.colorId);
-      polygonWidgets.add(Polygon(
-        points: p.vertices,
-        holePointsList: p.holes.isEmpty
-            ? null
-            : p.holes.map((h) => h).toList(),
-        color: c.withValues(alpha: 0.35),
-        borderColor: c,
-        borderStrokeWidth: 2,
-      ));
-    }
-
     // ── 自分のピンのみ表示（★相手のピンは表示しない） ──
     final myPins = _photoPins.where((p) => p.ownerUid == myUid).toList();
 
@@ -594,8 +579,12 @@ class _VersusBattleScreenState extends State<VersusBattleScreen> {
                 userAgentPackageName: 'com.example.RunnerTests',
                 maxZoom: 19,
               ),
-              if (polygonWidgets.isNotEmpty)
-                PolygonLayer(polygons: polygonWidgets),
+              // ★ 対戦ポリゴン描画（Demotest3-3 方式 + 実行時視覚的減算）
+              //   A∩B は常に A（新しい方）の色のみで塗られる。
+              VersusPolygonsOverlay(
+                polygons: _polygons,
+                myUid: myUid,
+              ),
               // 自分のピン（detached を含む。detached は透過率を下げて表示）
               MarkerLayer(
                 markers: [

@@ -3,17 +3,22 @@ import 'dart:math' as math;
 import 'package:latlong2/latlong.dart';
 
 import '../models/polygon.dart';
+import 'polygon_clip_service.dart';
 
 /// リザルト画面の % バーで使う面積計算。
 ///
-/// 仕様（11-3）:
-///   - 全多角形の頂点から bounding box を算出し、20% パディングを加えた
-///     矩形の面積を「盤面面積 F」とする。
-///   - 各プレイヤーの塗り面積 S = 全所有多角形の実効面積合計。
-///   - `self%  = S_self / F * 100`
-///     `opp%   = S_opp  / F * 100`
-///   - 浮動小数誤差で合計 100% 超なら 100 にクランプ。
-///   - 多角形 0 個の場合は 0.0%。
+/// v4-1-2 で「盤面 F(bounding box) 基準」から
+///   **「両者の実効面積比（合計 100%）」**
+/// に変更した:
+///   * `myPercent = S_self / (S_self + S_opp) * 100`
+///   * `oppPercent = S_opp / (S_self + S_opp) * 100`
+///   * 両者 0 の場合は 0% / 0% を返す。
+///
+/// また、Firestore 側の幾何減算が未反映のまま表示されるケースに備え、
+/// 各ポリゴンの **実効面積** は
+///   ( P の外周 − 宣言済み holes − P より新しい全ポリゴンの外周 )
+/// で算出する。これで A∩B の面積は A 側にだけ計上され、B 側では
+/// 二重計上されない。
 class AreaShareCalculator {
   AreaShareCalculator._();
 
@@ -26,46 +31,45 @@ class AreaShareCalculator {
     required String oppUid,
   }) {
     final live = polygons
-        .where((p) => p.isActive && p.vertices.length >= 3)
-        .toList();
+        .where((p) => p.isActive && p.vertices.length >= 3 && p.confirmed)
+        .toList()
+      ..sort((a, b) {
+        final aT = a.createdAt?.millisecondsSinceEpoch ?? 0;
+        final bT = b.createdAt?.millisecondsSinceEpoch ?? 0;
+        return aT.compareTo(bT);
+      });
+
     if (live.isEmpty) {
-      return const AreaShareResult(
-          myPercent: 0.0, opponentPercent: 0.0, boardAreaM2: 0.0);
+      return const AreaShareResult(myPercent: 0.0, opponentPercent: 0.0);
     }
 
-    // すべての頂点を集める
-    double minLat = double.infinity, maxLat = -double.infinity;
-    double minLng = double.infinity, maxLng = -double.infinity;
+    // 参照緯度（cos(lat) 補正の基準）
+    double sumLat = 0.0;
+    int cnt = 0;
     for (final p in live) {
       for (final v in p.vertices) {
-        if (v.latitude < minLat) minLat = v.latitude;
-        if (v.latitude > maxLat) maxLat = v.latitude;
-        if (v.longitude < minLng) minLng = v.longitude;
-        if (v.longitude > maxLng) maxLng = v.longitude;
+        sumLat += v.latitude;
+        cnt++;
       }
     }
-
-    // 20% パディング
-    final latPad = (maxLat - minLat) * 0.2;
-    final lngPad = (maxLng - minLng) * 0.2;
-    minLat -= latPad;
-    maxLat += latPad;
-    minLng -= lngPad;
-    maxLng += lngPad;
-
-    final refLat = (minLat + maxLat) / 2.0;
-    final mPerLng = _mPerDegLat * math.cos(refLat * math.pi / 180.0);
-    final boardW = (maxLng - minLng) * mPerLng;
-    final boardH = (maxLat - minLat) * _mPerDegLat;
-    final board = boardW.abs() * boardH.abs();
-    if (board <= 0) {
-      return const AreaShareResult(
-          myPercent: 0.0, opponentPercent: 0.0, boardAreaM2: 0.0);
-    }
+    final refLat = cnt > 0 ? sumLat / cnt : 0.0;
 
     double mySum = 0.0, oppSum = 0.0;
-    for (final p in live) {
-      final a = _areaWithHoles(p, refLat);
+    for (int i = 0; i < live.length; i++) {
+      final p = live[i];
+      // (1) 外周から自身の holes を引く
+      double a = _polyArea(p.vertices, refLat);
+      for (final h in p.holes) {
+        if (h.length >= 3) a -= _polyArea(h, refLat);
+      }
+      // (2) P より新しいすべての Q との重なり面積を差し引く（視覚と一致させる）
+      for (int j = i + 1; j < live.length; j++) {
+        final q = live[j];
+        final overlap = _overlapArea(p.vertices, q.vertices, refLat);
+        a -= overlap;
+      }
+      if (a < 0) a = 0.0;
+
       if (p.ownerUid == myUid) {
         mySum += a;
       } else if (p.ownerUid == oppUid) {
@@ -73,35 +77,43 @@ class AreaShareCalculator {
       }
     }
 
-    double my = (mySum / board) * 100.0;
-    double opp = (oppSum / board) * 100.0;
-    if (my.isNaN) my = 0.0;
-    if (opp.isNaN) opp = 0.0;
-    if (my < 0) my = 0.0;
-    if (opp < 0) opp = 0.0;
-    // 浮動小数誤差で合計 100% 超はクランプ
-    if (my + opp > 100.0) {
-      final scale = 100.0 / (my + opp);
-      my *= scale;
-      opp *= scale;
+    final total = mySum + oppSum;
+    if (total <= 0) {
+      return const AreaShareResult(myPercent: 0.0, opponentPercent: 0.0);
     }
-
-    return AreaShareResult(
-      myPercent: my,
-      opponentPercent: opp,
-      boardAreaM2: board,
-    );
+    final my = mySum / total * 100.0;
+    final opp = oppSum / total * 100.0;
+    return AreaShareResult(myPercent: my, opponentPercent: opp);
   }
 
-  /// 外周から穴の面積を引いた実効面積。
-  static double _areaWithHoles(WalkPolygon p, double refLat) {
-    final outer = _polyArea(p.vertices, refLat);
-    double holeSum = 0.0;
-    for (final h in p.holes) {
-      holeSum += _polyArea(h, refLat);
+  /// P と Q の重なり領域（P ∩ Q）の面積。
+  /// PolygonClipService.classify を使い、P − Q の結果から
+  /// overlap = area(P) − area(P − Q) を求める。
+  static double _overlapArea(
+    List<LatLng> pRing,
+    List<LatLng> qRing,
+    double refLat,
+  ) {
+    if (pRing.length < 3 || qRing.length < 3) return 0.0;
+    if (!PolygonClipService.regionsOverlap(pRing, qRing)) return 0.0;
+    final outcome = PolygonClipService.classify(pRing, qRing);
+    final pArea = _polyArea(pRing, refLat);
+    switch (outcome.kind) {
+      case SubtractKind.unchanged:
+        return 0.0;
+      case SubtractKind.consumed:
+        return pArea; // 完全に Q に取られた
+      case SubtractKind.updatedSingle:
+        return pArea - _polyArea(outcome.single!, refLat);
+      case SubtractKind.holed:
+        return _polyArea(outcome.hole!, refLat);
+      case SubtractKind.split:
+        double rest = 0.0;
+        for (final r in outcome.pieces!) {
+          rest += _polyArea(r, refLat);
+        }
+        return pArea - rest;
     }
-    final v = outer - holeSum;
-    return v < 0 ? 0.0 : v;
   }
 
   static double _polyArea(List<LatLng> verts, double refLat) {
@@ -124,10 +136,8 @@ class AreaShareCalculator {
 class AreaShareResult {
   final double myPercent;
   final double opponentPercent;
-  final double boardAreaM2;
   const AreaShareResult({
     required this.myPercent,
     required this.opponentPercent,
-    required this.boardAreaM2,
   });
 }

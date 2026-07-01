@@ -18,6 +18,7 @@ import '../services/firestore_sync_service.dart';
 import 'dialogs/result_close_confirm_dialog.dart';
 import 'versus_lobby_screen.dart';
 import 'widgets/area_share_bar.dart';
+import 'widgets/versus_polygons_overlay.dart';
 
 /// リザルト画面（ended / result_shown）。
 ///
@@ -183,19 +184,6 @@ class _VersusResultScreenState extends State<VersusResultScreen> {
       oppUid: b.opponentOf(myUid),
     );
 
-    final polygonWidgets = <Polygon>[];
-    for (final p in _polygons) {
-      if (!p.isActive || p.vertices.length < 3) continue;
-      final c = _colorFromId(p.colorId);
-      polygonWidgets.add(Polygon(
-        points: p.vertices,
-        holePointsList: p.holes.isEmpty ? null : p.holes.map((h) => h).toList(),
-        color: c.withValues(alpha: 0.35),
-        borderColor: c,
-        borderStrokeWidth: 2,
-      ));
-    }
-
     // 相手のピンは表示しない（active と同一のルール）
     final myPins = _photoPins.where((p) => p.ownerUid == myUid).toList();
 
@@ -229,8 +217,12 @@ class _VersusResultScreenState extends State<VersusResultScreen> {
                   userAgentPackageName: 'com.example.RunnerTests',
                   maxZoom: 19,
                 ),
-                if (polygonWidgets.isNotEmpty)
-                  PolygonLayer(polygons: polygonWidgets),
+                // ★ 対戦ポリゴン描画（Demotest3-3 方式 + 実行時視覚的減算）
+                //   A∩B は常に A（新しい方）の色のみで塗られる。
+                VersusPolygonsOverlay(
+                  polygons: _polygons,
+                  myUid: myUid,
+                ),
                 MarkerLayer(
                   markers: [
                     for (final pin in myPins)
