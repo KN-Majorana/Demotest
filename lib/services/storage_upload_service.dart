@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:firebase_storage/firebase_storage.dart';
 
@@ -36,5 +37,54 @@ class StorageUploadService {
     } catch (_) {
       // 未アップロード / 既に削除済みなどは無視
     }
+  }
+
+  // ── 対戦(battle)スコープ ──────────────────────────
+  //   保存パス: battles/{battleId}/{ownerUid}/{photoId}.jpg
+
+  static Future<String> uploadBattlePhoto({
+    required String battleId,
+    required String ownerUid,
+    required String photoId,
+    required String localPath,
+  }) async {
+    final ref =
+        _storage.ref('battles/$battleId/$ownerUid/$photoId.jpg');
+    final task = await ref.putFile(
+      File(localPath),
+      SettableMetadata(contentType: 'image/jpeg'),
+    );
+    return task.ref.getDownloadURL();
+  }
+
+  static Future<void> deleteBattlePhoto({
+    required String battleId,
+    required String ownerUid,
+    required String photoId,
+  }) async {
+    try {
+      await _storage
+          .ref('battles/$battleId/$ownerUid/$photoId.jpg')
+          .delete();
+    } catch (_) {}
+  }
+
+  /// リザルト画像を Storage に上げて URL を返す。
+  static Future<String> uploadResultSnapshot({
+    required String battleId,
+    required List<int> pngBytes,
+  }) async {
+    final ref = _storage.ref('battles/$battleId/result.png');
+    final task = await ref.putData(
+      Uint8List.fromList(pngBytes),
+      SettableMetadata(contentType: 'image/png'),
+    );
+    return task.ref.getDownloadURL();
+  }
+
+  static Future<void> deleteResultSnapshot(String battleId) async {
+    try {
+      await _storage.ref('battles/$battleId/result.png').delete();
+    } catch (_) {}
   }
 }

@@ -49,10 +49,13 @@ class PolygonCreateResult {
 class PolygonCreateFlow {
   PolygonCreateFlow._();
 
+  /// [forcedColorId] を指定すると（対戦モード）、色選択ステップを丸ごと
+  /// スキップし、色はその値に固定される。
   static Future<PolygonCreateResult?> run(
     BuildContext context, {
     required List<WalkPolygon> myConfirmedPolygons,
     required LatLng currentPosition,
+    int? forcedColorId,
   }) async {
     // 自分が所有する色 → 個数
     final ownedCounts = <int, int>{};
@@ -71,7 +74,10 @@ class PolygonCreateFlow {
 
     int? colorId;
 
-    if (method == PolygonCreateMethod.createNew) {
+    if (forcedColorId != null) {
+      // 対戦モード：色は自分の割当色に固定（色選択をスキップ）
+      colorId = forcedColorId;
+    } else if (method == PolygonCreateMethod.createNew) {
       // ── ステップ B-①：色選択（全24色）──
       colorId = await ColorPickSheet.show(
         context,

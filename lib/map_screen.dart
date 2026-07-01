@@ -4,13 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 
-import 'area_ranking_screen.dart';
 import 'color_collage_screen.dart';
 import 'color_extraction.dart';
 import 'fog_settings_service.dart';
 import 'current_location_marker.dart';
 import 'fog_overlay.dart';
-import 'friends_screen.dart';
 import 'ghost_track.dart';
 import 'location_service.dart';
 import 'map_mode.dart';
@@ -24,7 +22,6 @@ import 'polygon_create_flow.dart';
 import 'recording_controls.dart';
 import 'track_picker_sheet.dart';
 import 'track_storage_service.dart';
-import 'versus_mode_overlay.dart';
 import 'walk_track.dart';
 import 'ghost_marker.dart';
 import 'models/friend_profile.dart';
@@ -34,10 +31,9 @@ import 'services/export_service.dart';
 import 'services/firebase_auth_service.dart';
 import 'services/firestore_sync_service.dart';
 import 'services/photo_pin_storage_service.dart';
-import 'services/polygon_clip_service.dart';
 import 'services/polygon_overlap_service.dart';
 import 'services/polygon_storage_service.dart';
-import 'services/storage_upload_service.dart';
+import 'versus/versus_mode_view.dart';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -709,6 +705,42 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
+  /// リアルタイム 1v1 対決（battle）画面を全画面で開く。
+  /// ロビー→着信→バトル→リザルトの状態遷移は VersusModeView が購読で管理する。
+  void _openBattle() {
+    final profile = _myProfile;
+    if (profile == null) {
+      _toast('対戦モードに接続中です…少し待って再度お試しください');
+      return;
+    }
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => Scaffold(
+          appBar: AppBar(
+            title: const Text('対決'),
+            backgroundColor: const Color(0xFFD32F2F),
+            foregroundColor: Colors.white,
+          ),
+          body: VersusModeView(
+            myProfile: profile,
+            onDisplayNameChanged: (name) {
+              if (!mounted) return;
+              setState(() {
+                _myProfile = FriendProfile(
+                  uid: profile.uid,
+                  displayName: name,
+                  code: profile.code,
+                );
+              });
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
   // ─── 「多角形を作る」フロー（ステップ A→B→C→D） ───
   Future<void> _openCreatePolygonFlow() async {
     try {
@@ -1282,8 +1314,18 @@ class _MapScreenState extends State<MapScreen> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          // 対戦モード: ランキング & フレンド
+          // 対戦モード: 対決 / ランキング & フレンド
           if (_mode == MapMode.versus) ...[
+            FloatingActionButton.extended(
+              onPressed: _openBattle,
+              heroTag: 'start_battle',
+              tooltip: 'リアルタイム1v1対決',
+              backgroundColor: const Color(0xFFD32F2F),
+              foregroundColor: Colors.white,
+              icon: const Icon(Icons.sports_kabaddi),
+              label: const Text('対決'),
+            ),
+            const SizedBox(height: 8),
             FloatingActionButton.small(
               onPressed: _openRanking,
               heroTag: 'area_ranking',

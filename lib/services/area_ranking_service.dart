@@ -80,3 +80,43 @@ class _Agg {
   double area = 0.0;
   _Agg(this.ownerUid, this.ownerName, this.colorId);
 }
+
+/// 1v1 スコア（プレイヤー1人分）
+class BattleScore {
+  final String uid;
+  double areaMeters;
+  int polygonCount;
+  int stealCount; // 相手を削り取った回数（近似）
+  BattleScore(this.uid)
+      : areaMeters = 0,
+        polygonCount = 0,
+        stealCount = 0;
+}
+
+/// battle スコープの多角形から、各プレイヤーのスコアを集計する。
+Map<String, BattleScore> computeBattleScores(List<WalkPolygon> polys) {
+  final confirmed =
+      polys.where((p) => p.confirmed && p.isActive).toList();
+
+  // polygonId -> ownerUid（減算元の所有者を引くため）
+  final idOwner = <String, String>{
+    for (final p in confirmed) p.id: p.ownerUid,
+  };
+
+  final scores = <String, BattleScore>{};
+  BattleScore scoreOf(String uid) =>
+      scores.putIfAbsent(uid, () => BattleScore(uid));
+
+  for (final p in confirmed) {
+    final s = scoreOf(p.ownerUid);
+    s.areaMeters += AreaRankingService.regionArea(p);
+    s.polygonCount += 1;
+    // 削り取り: この多角形を削った A の所有者に加算（近似）
+    final by = p.subtractedBy;
+    if (by != null) {
+      final subtractorUid = idOwner[by];
+      if (subtractorUid != null) scoreOf(subtractorUid).stealCount += 1;
+    }
+  }
+  return scores;
+}
