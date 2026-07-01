@@ -17,20 +17,25 @@ workflows:
       - name: Flutter pub get
         script: |
           flutter pub get
-      - name: Generate iOS Podfile / config (Info.plist は上書きしない)
+      - name: Generate iOS config (Info.plist は上書きしない)
         script: |
-          # 既存 ios プロジェクトをそのまま使う。Podfile 等が無ければ生成のみ行う。
+          # 既存 ios プロジェクトをそのまま使う。Generated.xcconfig 等の再生成のみ行う。
           flutter build ios --release --no-codesign --config-only
-      - name: Force iOS 13 platform (Firebase は iOS 13+ が必須)
+      - name: Ensure Podfile exists & force iOS 13 platform (Firebase は iOS 13+ が必須)
         script: |
           cd ios
-          if grep -q "platform :ios" Podfile; then
+          PODFILE_B64="cGxhdGZvcm0gOmlvcywgJzEzLjAnCgojIENvY29hUG9kcyBhbmFseXRpY3Mgc2VuZHMgbmV0d29yayBzdGF0cyBzeW5jaHJvbm91c2x5IGFmZmVjdGluZyBmbHV0dGVyIGJ1aWxkIGxhdGVuY3kuCkVOVlsnQ09DT0FQT0RTX0RJU0FCTEVfU1RBVFMnXSA9ICd0cnVlJwoKcHJvamVjdCAnUnVubmVyJywgewogICdEZWJ1ZycgPT4gOmRlYnVnLAogICdQcm9maWxlJyA9PiA6cmVsZWFzZSwKICAnUmVsZWFzZScgPT4gOnJlbGVhc2UsCn0KCmRlZiBmbHV0dGVyX3Jvb3QKICBnZW5lcmF0ZWRfeGNvZGVfYnVpbGRfc2V0dGluZ3NfcGF0aCA9IEZpbGUuZXhwYW5kX3BhdGgoRmlsZS5qb2luKCcuLicsICdGbHV0dGVyJywgJ0dlbmVyYXRlZC54Y2NvbmZpZycpLCBfX0ZJTEVfXykKICB1bmxlc3MgRmlsZS5leGlzdD8oZ2VuZXJhdGVkX3hjb2RlX2J1aWxkX3NldHRpbmdzX3BhdGgpCiAgICByYWlzZSAiI3tnZW5lcmF0ZWRfeGNvZGVfYnVpbGRfc2V0dGluZ3NfcGF0aH0gbXVzdCBleGlzdC4gSWYgeW91J3JlIHJ1bm5pbmcgcG9kIGluc3RhbGwgbWFudWFsbHksIG1ha2Ugc3VyZSBmbHV0dGVyIHB1YiBnZXQgaXMgZXhlY3V0ZWQgZmlyc3QiCiAgZW5kCgogIEZpbGUuZm9yZWFjaChnZW5lcmF0ZWRfeGNvZGVfYnVpbGRfc2V0dGluZ3NfcGF0aCkgZG8gfGxpbmV8CiAgICBtYXRjaGVzID0gbGluZS5tYXRjaCgvRkxVVFRFUl9ST09UXD0oLiopLykKICAgIHJldHVybiBtYXRjaGVzWzFdLnN0cmlwIGlmIG1hdGNoZXMKICBlbmQKICByYWlzZSAiRkxVVFRFUl9ST09UIG5vdCBmb3VuZCBpbiAje2dlbmVyYXRlZF94Y29kZV9idWlsZF9zZXR0aW5nc19wYXRofS4gVHJ5IGRlbGV0aW5nIEdlbmVyYXRlZC54Y2NvbmZpZywgdGhlbiBydW4gZmx1dHRlciBwdWIgZ2V0IgplbmQKCnJlcXVpcmUgRmlsZS5leHBhbmRfcGF0aChGaWxlLmpvaW4oJ3BhY2thZ2VzJywgJ2ZsdXR0ZXJfdG9vbHMnLCAnYmluJywgJ3BvZGhlbHBlcicpLCBmbHV0dGVyX3Jvb3QpCgpmbHV0dGVyX2lvc19wb2RmaWxlX3NldHVwCgp0YXJnZXQgJ1J1bm5lcicgZG8KICB1c2VfZnJhbWV3b3JrcyEKICB1c2VfbW9kdWxhcl9oZWFkZXJzIQoKICBmbHV0dGVyX2luc3RhbGxfYWxsX2lvc19wb2RzIEZpbGUuZGlybmFtZShGaWxlLnJlYWxwYXRoKF9fRklMRV9fKSkKICB0YXJnZXQgJ1J1bm5lclRlc3RzJyBkbwogICAgaW5oZXJpdCEgOnNlYXJjaF9wYXRocwogIGVuZAplbmQKCnBvc3RfaW5zdGFsbCBkbyB8aW5zdGFsbGVyfAogIGluc3RhbGxlci5wb2RzX3Byb2plY3QudGFyZ2V0cy5lYWNoIGRvIHx0YXJnZXR8CiAgICBmbHV0dGVyX2FkZGl0aW9uYWxfaW9zX2J1aWxkX3NldHRpbmdzKHRhcmdldCkKICBlbmQKZW5kCg=="
+          if [ ! -f Podfile ]; then
+            echo "Podfile が見つからないため標準テンプレートを新規作成します"
+            echo "$PODFILE_B64" | base64 -D > Podfile 2>/dev/null || echo "$PODFILE_B64" | base64 --decode > Podfile
+          elif grep -q "platform :ios" Podfile; then
             sed -i.bak "s/^# *platform :ios.*/platform :ios, '13.0'/" Podfile
             sed -i.bak "s/^platform :ios.*/platform :ios, '13.0'/" Podfile
           else
-            printf "platform :ios, '13.0'\n%s" "$(cat Podfile)" > Podfile
+            sed -i.bak "1i platform :ios, '13.0'" Podfile
           fi
-          grep "platform :ios" Podfile || true
+          echo "----- Podfile の内容 -----"
+          cat Podfile
       - name: Pod install
         script: |
           cd ios
@@ -78,16 +83,24 @@ workflows:
             --create
           keychain add-certificates
           xcode-project use-profiles
-      - name: Generate config & force iOS 13 platform
+      - name: Generate iOS config (Info.plist は上書きしない)
         script: |
           flutter build ios --release --no-codesign --config-only
+      - name: Ensure Podfile exists & force iOS 13 platform (Firebase は iOS 13+ が必須)
+        script: |
           cd ios
-          if grep -q "platform :ios" Podfile; then
+          PODFILE_B64="cGxhdGZvcm0gOmlvcywgJzEzLjAnCgojIENvY29hUG9kcyBhbmFseXRpY3Mgc2VuZHMgbmV0d29yayBzdGF0cyBzeW5jaHJvbm91c2x5IGFmZmVjdGluZyBmbHV0dGVyIGJ1aWxkIGxhdGVuY3kuCkVOVlsnQ09DT0FQT0RTX0RJU0FCTEVfU1RBVFMnXSA9ICd0cnVlJwoKcHJvamVjdCAnUnVubmVyJywgewogICdEZWJ1ZycgPT4gOmRlYnVnLAogICdQcm9maWxlJyA9PiA6cmVsZWFzZSwKICAnUmVsZWFzZScgPT4gOnJlbGVhc2UsCn0KCmRlZiBmbHV0dGVyX3Jvb3QKICBnZW5lcmF0ZWRfeGNvZGVfYnVpbGRfc2V0dGluZ3NfcGF0aCA9IEZpbGUuZXhwYW5kX3BhdGgoRmlsZS5qb2luKCcuLicsICdGbHV0dGVyJywgJ0dlbmVyYXRlZC54Y2NvbmZpZycpLCBfX0ZJTEVfXykKICB1bmxlc3MgRmlsZS5leGlzdD8oZ2VuZXJhdGVkX3hjb2RlX2J1aWxkX3NldHRpbmdzX3BhdGgpCiAgICByYWlzZSAiI3tnZW5lcmF0ZWRfeGNvZGVfYnVpbGRfc2V0dGluZ3NfcGF0aH0gbXVzdCBleGlzdC4gSWYgeW91J3JlIHJ1bm5pbmcgcG9kIGluc3RhbGwgbWFudWFsbHksIG1ha2Ugc3VyZSBmbHV0dGVyIHB1YiBnZXQgaXMgZXhlY3V0ZWQgZmlyc3QiCiAgZW5kCgogIEZpbGUuZm9yZWFjaChnZW5lcmF0ZWRfeGNvZGVfYnVpbGRfc2V0dGluZ3NfcGF0aCkgZG8gfGxpbmV8CiAgICBtYXRjaGVzID0gbGluZS5tYXRjaCgvRkxVVFRFUl9ST09UXD0oLiopLykKICAgIHJldHVybiBtYXRjaGVzWzFdLnN0cmlwIGlmIG1hdGNoZXMKICBlbmQKICByYWlzZSAiRkxVVFRFUl9ST09UIG5vdCBmb3VuZCBpbiAje2dlbmVyYXRlZF94Y29kZV9idWlsZF9zZXR0aW5nc19wYXRofS4gVHJ5IGRlbGV0aW5nIEdlbmVyYXRlZC54Y2NvbmZpZywgdGhlbiBydW4gZmx1dHRlciBwdWIgZ2V0IgplbmQKCnJlcXVpcmUgRmlsZS5leHBhbmRfcGF0aChGaWxlLmpvaW4oJ3BhY2thZ2VzJywgJ2ZsdXR0ZXJfdG9vbHMnLCAnYmluJywgJ3BvZGhlbHBlcicpLCBmbHV0dGVyX3Jvb3QpCgpmbHV0dGVyX2lvc19wb2RmaWxlX3NldHVwCgp0YXJnZXQgJ1J1bm5lcicgZG8KICB1c2VfZnJhbWV3b3JrcyEKICB1c2VfbW9kdWxhcl9oZWFkZXJzIQoKICBmbHV0dGVyX2luc3RhbGxfYWxsX2lvc19wb2RzIEZpbGUuZGlybmFtZShGaWxlLnJlYWxwYXRoKF9fRklMRV9fKSkKICB0YXJnZXQgJ1J1bm5lclRlc3RzJyBkbwogICAgaW5oZXJpdCEgOnNlYXJjaF9wYXRocwogIGVuZAplbmQKCnBvc3RfaW5zdGFsbCBkbyB8aW5zdGFsbGVyfAogIGluc3RhbGxlci5wb2RzX3Byb2plY3QudGFyZ2V0cy5lYWNoIGRvIHx0YXJnZXR8CiAgICBmbHV0dGVyX2FkZGl0aW9uYWxfaW9zX2J1aWxkX3NldHRpbmdzKHRhcmdldCkKICBlbmQKZW5kCg=="
+          if [ ! -f Podfile ]; then
+            echo "Podfile が見つからないため標準テンプレートを新規作成します"
+            echo "$PODFILE_B64" | base64 -D > Podfile 2>/dev/null || echo "$PODFILE_B64" | base64 --decode > Podfile
+          elif grep -q "platform :ios" Podfile; then
             sed -i.bak "s/^# *platform :ios.*/platform :ios, '13.0'/" Podfile
             sed -i.bak "s/^platform :ios.*/platform :ios, '13.0'/" Podfile
           else
-            printf "platform :ios, '13.0'\n%s" "$(cat Podfile)" > Podfile
+            sed -i.bak "1i platform :ios, '13.0'" Podfile
           fi
+          echo "----- Podfile の内容 -----"
+          cat Podfile
       - name: Pod install
         script: |
           cd ios
