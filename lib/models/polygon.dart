@@ -2,12 +2,17 @@ import 'package:latlong2/latlong.dart';
 
 /// 多角形（陣地）のドメインモデル。
 ///
-/// 注: flutter_map も `Polygon` という型をエクスポートしているため、
-/// 名前衝突を避ける目的でクラス名を [WalkPolygon] としている。
+/// 注: flutter_map も `Polygon` をエクスポートしているため、名前衝突を
+/// 避けてクラス名は [WalkPolygon] とする。
 ///
-/// - [vertices] は構成ピン位置の凸包（時計回り/反時計回りは問わない）。
-/// - [confirmed] が false の間は「準備中（ピン2枚以下）」を表し、
-///   塗り表示・Firestore 共有の対象外。3枚目で true になり [createdAt] が確定する。
+/// v4 で MultiPolygon（rings）表現を撤廃し、**単一の外周リング**
+/// ([vertices]) ＋ 任意の穴 ([holes]) に戻した。分裂は 1 ドキュメントに
+/// 複数リングを持たせるのではなく、独立したドキュメント群として表現する
+/// （firestore_sync_service 参照）。
+///   - [vertices]   単一の外周リング（CCW 目安）。
+///   - [holes]      穴（A ⊂ B のケース。無ければ空）。
+///   - [status]     'active'（実質これのみ。消滅は物理削除で表現）。
+///   - [confirmed]  false の間は準備中（ピン2枚以下）で共有対象外。
 class WalkPolygon {
   final String id;
   final String ownerUid;
@@ -16,17 +21,29 @@ class WalkPolygon {
   /// colorPalette24 のインデックス
   final int colorId;
 
-  /// 凸包頂点（緯度経度）
+  /// 単一の外周リング
   final List<LatLng> vertices;
+
+  /// 穴（任意）
+  final List<List<LatLng>> holes;
 
   /// 多角形が「確定した」時刻。準備中は null。
   final DateTime? createdAt;
 
+  /// 最後に減算（領域を奪われた）された時刻。
+  final DateTime? lastModifiedAt;
+
+  /// 直近の減算を行った A の polygonId（履歴用）。
+  final String? subtractedBy;
+
   /// 構成する写真ピンの ID リスト
   final List<String> photoIds;
 
-  /// 3点以上集まり、領域として確定済みか
+  /// 3点以上集まり領域として確定済みか
   final bool confirmed;
+
+  /// 'active'（実質これのみ）
+  final String status;
 
   const WalkPolygon({
     required this.id,
@@ -34,19 +51,30 @@ class WalkPolygon {
     required this.ownerName,
     required this.colorId,
     required this.vertices,
+    this.holes = const [],
     required this.createdAt,
     required this.photoIds,
     required this.confirmed,
+    this.lastModifiedAt,
+    this.subtractedBy,
+    this.status = 'active',
   });
+
+  int get vertexCount => vertices.length;
+  bool get isActive => status == 'active';
 
   WalkPolygon copyWith({
     String? ownerUid,
     String? ownerName,
     int? colorId,
     List<LatLng>? vertices,
+    List<List<LatLng>>? holes,
     DateTime? createdAt,
+    DateTime? lastModifiedAt,
+    String? subtractedBy,
     List<String>? photoIds,
     bool? confirmed,
+    String? status,
   }) {
     return WalkPolygon(
       id: id,
@@ -54,51 +82,103 @@ class WalkPolygon {
       ownerName: ownerName ?? this.ownerName,
       colorId: colorId ?? this.colorId,
       vertices: vertices ?? this.vertices,
+      holes: holes ?? this.holes,
       createdAt: createdAt ?? this.createdAt,
+      lastModifiedAt: lastModifiedAt ?? this.lastModifiedAt,
+      subtractedBy: subtractedBy ?? this.subtractedBy,
       photoIds: photoIds ?? this.photoIds,
       confirmed: confirmed ?? this.confirmed,
+      status: status ?? this.status,
     );
   }
 
-  /// Firestore / ローカル共通のマップ表現。
-  /// createdAt は比較が安定する epoch ミリ秒（int）で保持する。
+  // ── シリアライズ ──────────────────────────────
+
+  static Map<String, dynamic> _ll(LatLng v) =>
+      {'lat': v.latitude, 'lng': v.longitude};
+
+  static LatLng _toLL(dynamic e) {
+    final m = e as Map<String, dynamic>;
+    return LatLng((m['lat'] as num).toDouble(), (m['lng'] as num).toDouble());
+  }
+
+  static List<LatLng> _parsePoints(dynamic r) {
+    if (r is Map) {
+      return (r['points'] as List<dynamic>? ?? []).map(_toLL).toList();
+    }
+    return (r as List<dynamic>).map(_toLL).toList();
+  }
+
   Map<String, dynamic> toMap() => {
-    'id': id,
-    'ownerUid': ownerUid,
-    'ownerName': ownerName,
-    'colorId': colorId,
-    'vertices': vertices
-        .map((v) => {'lat': v.latitude, 'lng': v.longitude})
-        .toList(),
-    'createdAt': createdAt?.millisecondsSinceEpoch,
-    'photoIds': photoIds,
-    'confirmed': confirmed,
-  };
+        'id': id,
+        'ownerUid': ownerUid,
+        'ownerName': ownerName,
+        'colorId': colorId,
+        'vertices': vertices.map(_ll).toList(),
+        // Firestore は配列の直下に配列を置けないため、穴は map で包む。
+        'holes': holes.map((h) => {'points': h.map(_ll).toList()}).toList(),
+        'createdAt': createdAt?.millisecondsSinceEpoch,
+        'lastModifiedAt': lastModifiedAt?.millisecondsSinceEpoch,
+        'subtractedBy': subtractedBy,
+        'photoIds': photoIds,
+        'confirmed': confirmed,
+        'status': status,
+      };
 
   factory WalkPolygon.fromMap(Map<String, dynamic> map) {
-    final rawVerts = (map['vertices'] as List<dynamic>? ?? []);
-    final verts = rawVerts.map((e) {
-      final m = e as Map<String, dynamic>;
-      return LatLng(
-        (m['lat'] as num).toDouble(),
-        (m['lng'] as num).toDouble(),
-      );
-    }).toList();
+    // 外周リング
+    List<LatLng> vertices;
+    if (map['vertices'] != null) {
+      vertices = (map['vertices'] as List<dynamic>).map(_toLL).toList();
+    } else if (map['rings'] != null) {
+      // v3 旧形式との後方互換
+      final rings = (map['rings'] as List<dynamic>);
+      if (rings.length >= 2) {
+        // 実運用データが無い前提。マイグレーションは非対応。
+        throw StateError('v3 の複数リング多角形は非対応です（要マイグレーション）');
+      }
+      vertices = rings.isEmpty ? <LatLng>[] : _parsePoints(rings.first);
+    } else {
+      vertices = <LatLng>[];
+    }
+
+    // 穴
+    List<List<LatLng>> holes;
+    if (map['holes'] != null) {
+      holes = (map['holes'] as List<dynamic>).map((h) {
+        // 新形式 {'points':[...]} / 旧形式 [...] / v3 {'rings':[...]}
+        if (h is Map && h['points'] != null) return _parsePoints(h);
+        if (h is Map && h['rings'] != null) {
+          final inner = (h['rings'] as List<dynamic>);
+          return inner.isEmpty ? <LatLng>[] : _parsePoints(inner.first);
+        }
+        return _parsePoints(h);
+      }).toList();
+    } else {
+      holes = const [];
+    }
 
     final createdMs = map['createdAt'];
+    final modMs = map['lastModifiedAt'];
     return WalkPolygon(
       id: map['id'] as String,
       ownerUid: map['ownerUid'] as String? ?? '',
       ownerName: map['ownerName'] as String? ?? '名無し',
       colorId: (map['colorId'] as num?)?.toInt() ?? 0,
-      vertices: verts,
+      vertices: vertices,
+      holes: holes,
       createdAt: createdMs == null
           ? null
           : DateTime.fromMillisecondsSinceEpoch((createdMs as num).toInt()),
+      lastModifiedAt: modMs == null
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch((modMs as num).toInt()),
+      subtractedBy: map['subtractedBy'] as String?,
       photoIds: (map['photoIds'] as List<dynamic>? ?? [])
           .map((e) => e as String)
           .toList(),
       confirmed: map['confirmed'] as bool? ?? true,
+      status: map['status'] as String? ?? 'active',
     );
   }
 }

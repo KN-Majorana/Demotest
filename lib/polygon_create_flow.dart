@@ -7,24 +7,19 @@ import 'models/polygon.dart';
 import 'photo_service.dart';
 import 'services/exif_service.dart';
 import 'widgets/create_method_sheet.dart';
-import 'widgets/color_pick_sheet.dart';
-import 'widgets/existing_polygon_pick_sheet.dart';
 import 'widgets/photo_source_sheet.dart';
 
 enum PolygonCreateKind { createNew, addExisting }
 
-/// 多角形作成フロー（ステップ A→B→C→D）の結果。
+/// 多角形作成フローの結果。
 ///
-/// 色判定（colorIds）まで済ませた状態で返す。最終的な「色一致チェックと
-/// ピン確定」は呼び出し側（map_screen）の状態を使って行う。
+/// 対戦モード（v6-9）では **色選択ステップを完全にスキップ** するため、
+/// 呼び出し側から assignedColorId を渡す。色一致判定は呼び出し側で行う。
 class PolygonCreateResult {
   final PolygonCreateKind kind;
 
-  /// createNew のとき選んだ色（colorPalette24 のインデックス）
-  final int? colorId;
-
-  /// addExisting のとき選んだ多角形
-  final WalkPolygon? target;
+  /// 割り当てられた色（colorPalette24 のインデックス）
+  final int colorId;
 
   final String photoPath;
 
@@ -34,13 +29,12 @@ class PolygonCreateResult {
   final LatLng position;
   final DateTime takenAt;
 
-  /// ライブラリ選択時に EXIF が無く、現在地/現在時刻にフォールバックしたか
+  /// ライブラリ選択時に EXIF が無く現在地/現在時刻へフォールバックしたか
   final bool usedLocationFallback;
 
   const PolygonCreateResult({
     required this.kind,
     required this.colorId,
-    required this.target,
     required this.photoPath,
     required this.colorIds,
     required this.position,
@@ -49,63 +43,53 @@ class PolygonCreateResult {
   });
 }
 
-/// ステップ A→B→C→D を順に進める状態機械。
+/// 撮影フロー状態機械。
 ///
-/// 途中でキャンセル/閉じられた場合は null を返す（取得済み写真は破棄する）。
+/// 対戦モード（active）中は色選択ステップを飛ばし、割当色に自動固定する。
 class PolygonCreateFlow {
   PolygonCreateFlow._();
 
-  static Future<PolygonCreateResult?> run(
+  /// 対戦モード用エントリ。色はスキップ、[assignedColorId] に固定される。
+  ///
+  /// ── detached ピン除外フィルタの位置 ─────────────────────
+  ///   このフロー内では、pending / attached / detached の判別は行わない
+  ///   （純粋に「写真を取ってくる → 位置と色を用意する」責務のみ）。
+  ///   detached ピンを候補集合から除外する処理は versus_battle_screen 側
+  ///   `_createNewFlow` / `_addExistingFlow` で行っている（そこにも
+  ///   コメント付きで実装が明示されている）。
+  /// ─────────────────────────────────────────────────────
+  static Future<PolygonCreateResult?> runForVersus(
     BuildContext context, {
     required List<WalkPolygon> myConfirmedPolygons,
     required LatLng currentPosition,
+    required String battleId,
+    required int assignedColorId,
   }) async {
     // ── ステップ A：作成方法 ──
-    final method = await CreateMethodSheet.show(
-      context,
-      hasExisting: myConfirmedPolygons.isNotEmpty,
-    );
+    final hasExisting = myConfirmedPolygons.any((p) =>
+        p.colorId == assignedColorId && p.confirmed && p.isActive);
+    final method =
+        await CreateMethodSheet.show(context, hasExisting: hasExisting);
     if (method == null || !context.mounted) return null;
 
-    int? colorId;
-    WalkPolygon? target;
-
-    if (method == PolygonCreateMethod.createNew) {
-      // ── ステップ B-①：色選択 ──
-      colorId = await ColorPickSheet.show(context);
-      if (colorId == null || !context.mounted) return null;
-    } else {
-      // ── ステップ B-②：既存多角形の選択 ──
-      target = await ExistingPolygonPickSheet.show(
-        context,
-        polygons: myConfirmedPolygons,
-      );
-      if (target == null || !context.mounted) return null;
-    }
-
-    // ── ステップ C：写真取得元 ──
+    // ── ステップ B：写真取得元 ── (色選択はスキップ)
     final source = await PhotoSourceSheet.show(context);
     if (source == null) return null;
 
-    // ── 写真取得 ──
     String? path;
     LatLng position = currentPosition;
     DateTime takenAt = DateTime.now();
     bool usedFallback = false;
 
     if (source == PhotoSource.camera) {
-      // 撮影：現在地・現在時刻
       try {
         position = await LocationService.getCurrentPosition();
-      } catch (_) {
-        // 取得できなければ渡された現在地を使う
-      }
-      path = await PhotoService.takeAndSavePhoto();
-      if (path == null) return null; // キャンセル
+      } catch (_) {}
+      path = await PhotoService.takeAndSavePhotoForBattle(battleId);
+      if (path == null) return null;
     } else {
-      // ライブラリ：EXIF から GPS / 撮影日時を取得、無ければフォールバック
-      path = await PhotoService.pickFromGalleryAndSave();
-      if (path == null) return null; // キャンセル
+      path = await PhotoService.pickFromGalleryAndSaveForBattle(battleId);
+      if (path == null) return null;
 
       final exif = await ExifService.readExifForFile(path);
       if (exif.lat != null && exif.lng != null) {
@@ -120,15 +104,14 @@ class PolygonCreateFlow {
       }
     }
 
-    // ── ステップ D（前半）：色判定 ──
+    // ── ステップ D（内部処理）：色判定 ──
     final colorIds = await extractColorIdsFromPath(path);
 
     return PolygonCreateResult(
       kind: method == PolygonCreateMethod.createNew
           ? PolygonCreateKind.createNew
           : PolygonCreateKind.addExisting,
-      colorId: colorId,
-      target: target,
+      colorId: assignedColorId,
       photoPath: path,
       colorIds: colorIds,
       position: position,
